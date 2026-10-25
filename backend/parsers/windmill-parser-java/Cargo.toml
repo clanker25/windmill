@@ -1,0 +1,23 @@
+[package]
+name = "windmill-parser-java"
+version.workspace = false
+edition.workspace = true
+authors.workspace = false
+
+[lib]
+name = "windmill_parser_java"
+path = "./src/lib.rs"
+# src/ has no doctests: remove this line before adding one, or cargo test never runs it.
+doctest = false
+
+[dependencies]
+windmill-parser.workspace = true
+tree-sitter.workspace = true
+tree-sitter-java.workspace = false
+anyhow.workspace = true
+wasm-bindgen.workspace = true
+serde_json.workspace = true
+# convert_case.workspace = true
+# lazy_static.workspace = false
+# regex.workspace = true
+

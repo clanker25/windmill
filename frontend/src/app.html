@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" href="/logo.svg" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfbfd" />
+		<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#3b4252" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<style type="text/css">
+			.st2 {
+				fill: #bcd4fc;
+			}
+
+			.st3 {
+				fill: #3b82f6;
+			}
+
+			/* Public app pages render their shell before app.css loads, if at all. */
+			html[data-wm-public-app] #svelte-global-loader {
+				display: none;
+			}
+			html[data-wm-public-app] body {
+				margin: 0;
+			}
+			html[data-wm-public-app='dark'] body {
+				background-color: #3b4252;
+			}
+
+			/* Background color for dark mode */
+			@media (prefers-color-scheme: dark) {
+				#mainbg {
+					background-color: #3b4252; /* Example: dark gray background for dark mode */
+				}
+				#loading-text {
+					color: #a8aeb7 !important;
+				}
+			}
+		</style>
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<script>
+			// WIN-2006: when the app is rendered inside an opaque-origin (sandboxed,
+			// no allow-same-origin) iframe, Web Storage access throws a SecurityError.
+			// Install an in-memory shim before the SvelteKit app boots so the app (and
+			// Windmill SPA code running inside the frame) keeps working within the
+			// session. No-op in normal real-origin contexts, so zero blast radius.
+			;(function () {
+				// `onOp` (localStorage only) relays each mutation up to the embedder,
+				// which backs a single store shared across all apps. sessionStorage
+				// stays in-memory/session-only.
+				function shim(onOp) {
+					var m = {}
+					return {
+						__hydrate: function (obj) {
+							if (obj) for (var k in obj) m['' + k] = '' + obj[k]
+						},
+						getItem: function (k) {
+							k = '' + k
+							return Object.prototype.hasOwnProperty.call(m, k) ? m[k] : null
+						},
+						setItem: function (k, v) {
+							m['' + k] = '' + v
+							if (onOp) onOp({ op: 'set', key: '' + k, value: '' + v })
+						},
+						removeItem: function (k) {
+							delete m['' + k]
+							if (onOp) onOp({ op: 'remove', key: '' + k })
+						},
+						clear: function () {
+							for (var k in m) delete m[k]
+							if (onOp) onOp({ op: 'clear' })
+						},
+						key: function (i) {
+							var ks = Object.keys(m)
+							return i < ks.length ? ks[i] : null
+						},
+						get length() {
+							return Object.keys(m).length
+						}
+					}
+				}
+				try {
+					window.localStorage.getItem('__wm_probe__')
+				} catch (e) {
+					var framed = window.parent !== window
+					function relayOp(o) {
+						if (framed)
+							try {
+								window.parent.postMessage(
+									{ type: 'wm_ls_op', op: o.op, key: o.key, value: o.value },
+									'*'
+								)
+							} catch (_) {}
+					}
+					var ls = shim(framed ? relayOp : null)
+					try {
+						Object.defineProperty(window, 'localStorage', { value: ls, configurable: true })
+					} catch (_) {}
+					try {
+						Object.defineProperty(window, 'sessionStorage', {
+							value: shim(null),
+							configurable: true
+						})
+					} catch (_) {}
+					// Persistence: ask the embedder for the shared store and hydrate the
+					// in-memory localStorage when it arrives.
+					if (framed) {
+						window.addEventListener('message', function (ev) {
+							if (ev.source === window.parent && ev.data && ev.data.type === 'wm_ls_hydrate') {
+								ls.__hydrate(ev.data.data)
+							}
+						})
+						try {
+							window.parent.postMessage({ type: 'wm_ls_req' }, '*')
+						} catch (_) {}
+					}
+					// `document.cookie` also throws in an opaque origin; back it with an
+					// in-memory jar so reads don't crash apps. This is NOT the real
+					// session cookie (unreachable here) — just an isolated client-side store.
+					try {
+						var jar = {}
+						Object.defineProperty(Document.prototype, 'cookie', {
+							configurable: true,
+							get: function () {
+								return Object.keys(jar)
+									.map(function (k) {
+										return k + '=' + jar[k]
+									})
+									.join('; ')
+							},
+							set: function (v) {
+								var p = String(v).split(';')[0]
+								var i = p.indexOf('=')
+								if (i > -1) jar[p.slice(0, i).trim()] = p.slice(i + 1).trim()
+							}
+						})
+					} catch (_) {}
+				}
+			})()
+		</script>
+		<script>
+			// Public app pages (`/public/<ws>/<secret>`, `/a/<custom path>`): skip the loading
+			// screen, and start the API calls the page makes first so they overlap the module
+			// download instead of following it. `publicAppApi.ts` takes these responses by URL,
+			// so each URL here must be exactly what it requests. Only the cookie credential is
+			// prefetched: a share link carrying a JWT, or the opaque viewer frame (`wm_embed`),
+			// sends its own and fetches normally. The bundle of an unsandboxed raw app is
+			// requested as soon as its secret is known, for the iframe to find in the HTTP cache.
+			;(function () {
+				var path = location.pathname
+				var pub = /^\/public\/([^/]+)\/([^/]+)\/?$/.exec(path)
+				var custom = /^\/a\/(.+?)\/?$/.exec(path)
+				if (!pub && !custom && !/^\/public\//.test(path)) return
+				// Dark as PublicApp decides it, painted before any stylesheet so that a dark app
+				// does not load over a white page.
+				var dark = false
+				try {
+					var mode = localStorage.getItem('dark-mode')
+					dark = mode ? mode === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches
+				} catch (_) {}
+				document.documentElement.setAttribute('data-wm-public-app', dark ? 'dark' : '')
+				if (new URLSearchParams(location.search).get('wm_embed') === '1') return
+				var prefetched = (window.__wmPublicAppPrefetch = {})
+				function get(url) {
+					var res = fetch(url)
+					res.catch(function () {})
+					prefetched[url] = res
+					return res
+				}
+				function warmBundle(appRes, workspace) {
+					appRes
+						.then(function (r) {
+							return r.ok ? r.clone().json() : null
+						})
+						.then(function (app) {
+							if (!app || !app.raw_app || !app.bundle_secret || (app.policy || {}).sandbox) return
+							var ws = workspace || app.workspace_id
+							var v = '/api/w/' + ws + '/apps_u/get_data/v/' + app.bundle_secret
+							fetch(v + '.css').catch(function () {})
+							fetch(v + '.js').catch(function () {})
+						})
+						.catch(function () {})
+				}
+				if (pub) {
+					var w = '/api/w/' + pub[1]
+					get(w + '/apps_u/embed_token/' + pub[2])
+					warmBundle(get(w + '/apps_u/public_app/' + pub[2]), pub[1])
+					get(w + '/apps_u/guest_entry/' + pub[2])
+					get(w + '/users/whoami')
+				} else if (custom && custom[1].indexOf('.') === -1) {
+					// A `.` marks a trailing JWT segment, which no custom path contains.
+					get('/api/apps_u/embed_token_by_custom_path/' + custom[1])
+					warmBundle(get('/api/apps_u/public_app_by_custom_path/' + custom[1]))
+					get('/api/apps_u/guest_entry_by_custom_path/' + custom[1])
+				}
+				get('/api/ee_license')
+			})()
+		</script>
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-code="viewport" class="outline-none focus:outline-none">
+		<div style="display: contents">
+			<div id="svelte-global-loader">
+				<div id="mainbg" style="position: absolute; bottom: 0; left: 0; width: 100%; height: 100vh">
+				</div>
+
+				<div style="position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%)">
+					<svg
+						version="1.1"
+						id="Windmill"
+						xmlns="http://www.w3.org/2000/svg"
+						xmlns:xlink="http://www.w3.org/1999/xlink"
+						x="0px"
+						y="0px"
+						width="128px"
+						height="128px"
+						viewBox="0 0 256 256"
+						style="enable-background: new 0 0 256 256"
+						xml:space="preserve"
+					>
+						<g>
+							<polygon
+								class="st2"
+								points="134.78,14.22 114.31,48.21 101.33,69.75 158.22,69.75 177.97,36.95 191.67,14.22 	"
+							/>
+							<polygon
+								class="st3"
+								points="227.55,69.75 186.61,69.75 101.33,69.75 129.78,119.02 158.16,119.02 228.61,119.02 256,119.02 	"
+							/>
+							<polygon
+								class="st3"
+								points="136.93,132.47 116.46,167.93 73.82,241.78 130.71,241.78 144.9,217.2 180.13,156.18 193.82,132.46
+		"
+							/>
+							<polygon
+								class="st3"
+								points="121.7,131.95 101.23,96.49 58.59,22.63 30.15,71.91 44.34,96.49 79.57,157.5 93.26,181.22 	"
+							/>
+							<polygon
+								class="st2"
+								points="64.81,131.95 25.15,131.21 0,130.74 28.44,180.01 66.73,180.72 93.26,181.21 	"
+							/>
+							<polygon
+								class="st2"
+								points="165.38,181.74 184.58,216.46 196.75,238.47 225.19,189.2 206.66,155.69 193.83,132.46 	"
+							/>
+						</g>
+					</svg>
+					<div
+						id="loading-text"
+						style="
+							text-align: center;
+							margin-top: 30px;
+							color: gray;
+							font-family: Arial, Helvetica, sans-serif;
+						"
+					>
+						Loading...
+					</div>
+				</div>
+			</div>
+			%sveltekit.body%
+		</div>
+	</body>
+</html>

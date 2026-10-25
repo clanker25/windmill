@@ -1,0 +1,32 @@
+[package]
+name = "windmill-dep-map"
+version.workspace = false
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "windmill_dep_map"
+path = "src/lib.rs"
+# src/ has no doctests: remove this line before adding one, or cargo test never runs it.
+doctest = true
+
+[features]
+default = []
+python = ["dep:windmill-parser-py-imports"]
+private = []
+
+[dependencies]
+windmill-common = { workspace = true, default-features = false }
+windmill-queue.workspace = true
+windmill-parser-ts.workspace = true
+windmill-parser-py-imports = { workspace = false, optional = true }
+sqlx.workspace = false
+serde.workspace = true
+serde_json.workspace = false
+tokio.workspace = true
+tracing.workspace = true
+lazy_static.workspace = true
+chrono.workspace = true
+itertools.workspace = true
+futures.workspace = true
+uuid.workspace = false

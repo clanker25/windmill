@@ -1,0 +1,136 @@
+<script lang="ts">
+	import { classNames } from '$lib/utils'
+	import { Loader2 } from 'lucide-svelte'
+	import { createEventDispatcher } from 'svelte'
+
+	interface Props {
+		tabs: string[]
+		selectedIndex?: number
+		maxReachedIndex?: number
+		statusByStep?: Array<'success' | 'error' | 'pending'>
+		hasValidations?: boolean
+		allowStepNavigation?: boolean
+		/** Compact variant, for steering a dialog rather than a full page. */
+		small?: boolean
+		/** Steps this run does not go through, greyed out and not clickable — a step the
+		 *  chosen path skips rather than one not reached yet. */
+		disabledIndices?: number[]
+	}
+
+	let {
+		tabs,
+		selectedIndex = 0,
+		maxReachedIndex = -1,
+		statusByStep = [],
+		hasValidations = false,
+		allowStepNavigation = false,
+		small = false,
+		disabledIndices = []
+	}: Props = $props()
+
+	const dispatch = createEventDispatcher()
+
+	function getStepColor(
+		index: number,
+		selectedIndex: number,
+		statusByStep: Array<'success' | 'error' | 'pending'>,
+		maxReachedIndex: number
+	) {
+		if (!hasValidations) {
+			if (index === selectedIndex) {
+				return 'bg-blue-500 text-white'
+			} else if (index > maxReachedIndex) {
+				return 'bg-gray-200'
+			} else {
+				return 'bg-blue-200'
+			}
+		}
+
+		const current = index === selectedIndex
+		if (statusByStep[index] === 'success') {
+			return current
+				? 'border-green-500 border bg-green-200 text-green-600'
+				: 'border-green-500 border'
+		} else if (statusByStep[index] === 'error') {
+			return current
+				? 'border-red-500 border bg-red-200 text-red-600'
+				: 'border-red-500 bg-red-100 border'
+		} else {
+			if (index <= maxReachedIndex) {
+				return current
+					? 'border-blue-500 border bg-blue-200 text-blue-600'
+					: 'border-blue-500 border'
+			} else {
+				return current
+					? 'border-gray-500 border bg-gray-200 text-primary'
+					: 'border-gray-500 border'
+			}
+		}
+	}
+</script>
+
+<div class="flex justify-between">
+	<ol
+		class={classNames(
+			'relative z-20 flex justify-between items-centers font-medium text-primary',
+			small ? 'text-xs' : 'text-sm'
+		)}
+	>
+		{#each tabs ?? [] as step, index}
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+			{@const disabled = disabledIndices.includes(index)}
+			<li
+				class={classNames(
+					small
+						? 'flex items-center gap-1.5 px-1.5 py-0.5 hover:bg-gray-1200 rounded-md m-0.5'
+						: 'flex items-center gap-2 px-2 py-1 hover:bg-gray-1200 rounded-md m-0.5',
+					disabled
+						? 'cursor-not-allowed opacity-50'
+						: index <= maxReachedIndex || allowStepNavigation
+							? 'cursor-pointer'
+							: 'cursor-not-allowed'
+				)}
+				onclick={() => {
+					if (!disabled) dispatch('click', { index })
+				}}
+			>
+				{#if statusByStep[index] === 'pending'}
+					<Loader2 class={classNames(small ? 'h-4 w-4' : 'h-6 w-6', 'animate-spin')} />
+				{:else}
+					<span
+						class={classNames(
+							small
+								? 'h-4 w-4 rounded-full flex items-center justify-center text-2xs'
+								: 'h-6 w-6 rounded-full flex items-center justify-center text-xs',
+							disabled
+								? 'bg-gray-200'
+								: getStepColor(index, selectedIndex, statusByStep, maxReachedIndex)
+						)}
+						class:font-bold={selectedIndex === index}
+					>
+						{index + 1}
+					</span>
+				{/if}
+
+				<span
+					class={classNames(
+						'hidden sm:block',
+						disabled
+							? 'font-normal text-disabled'
+							: selectedIndex === index
+								? 'font-semibold text-primary'
+								: 'font-normal text-primary'
+					)}
+				>
+					{step}
+				</span>
+			</li>
+			{#if index !== (tabs ?? []).length - 1}
+				<li class="flex items-center">
+					<div class={classNames('h-0.5 bg-blue-200', small ? 'w-2' : 'w-4')}></div>
+				</li>
+			{/if}
+		{/each}
+	</ol>
+</div>

@@ -1,0 +1,596 @@
+<script lang="ts">
+	import { Button } from '$lib/components/common'
+	import {
+		clearPageDrawerAnchor,
+		setPageDrawerAnchor
+	} from '$lib/components/sessions/pageDrawerSession'
+	import { TRIGGER_PAGES } from '$lib/components/sessions/previewPaths'
+	import Drawer from '$lib/components/common/drawer/Drawer.svelte'
+	import DrawerContent from '$lib/components/common/drawer/DrawerContent.svelte'
+	import Path from '$lib/components/Path.svelte'
+	import TriggerRunnablePicker from '$lib/components/triggers/TriggerRunnablePicker.svelte'
+	import {
+		EmailTriggerService,
+		type EmailTrigger,
+		type NewEmailTrigger,
+		type Retry,
+		type TriggerMode
+	} from '$lib/gen'
+	import { usedTriggerKinds } from '$lib/stores'
+	import { capitalize, emptyString, sendUserToast } from '$lib/utils'
+	import { useEditRights } from '$lib/operatorWriteRights'
+	import Section from '$lib/components/Section.svelte'
+	import { Loader2 } from 'lucide-svelte'
+	import Label from '$lib/components/Label.svelte'
+	import EmailTriggerEditorConfigSection from './EmailTriggerEditorConfigSection.svelte'
+	import TriggerEditorToolbar from '../TriggerEditorToolbar.svelte'
+	import PermissionedAsLine from '../PermissionedAsLine.svelte'
+	import { handleConfigChange } from '../utils'
+	import { handlerDraftFromStored, handlerDraftToStored } from '../../handlerDraft.svelte'
+	import { untrack } from 'svelte'
+	import Tabs from '$lib/components/common/tabs/Tabs.svelte'
+	import Tab from '$lib/components/common/tabs/Tab.svelte'
+	import TriggerRetriesAndErrorHandler from '../TriggerRetriesAndErrorHandler.svelte'
+	import TriggerAdvancedBadges from '../TriggerAdvancedBadges.svelte'
+	import { saveEmailTriggerFromCfg } from './utils'
+	import { deepEqual } from 'fast-equals'
+	import { useTriggerDraftSync } from '../useTriggerDraftSync.svelte'
+	import LocalDraftBanner from '$lib/components/LocalDraftBanner.svelte'
+	import TriggerSuspendedJobsAlert from '../TriggerSuspendedJobsAlert.svelte'
+	import TriggerSuspendedJobsModal from '../TriggerSuspendedJobsModal.svelte'
+	import {
+		useOperatingUser,
+		useOperatingWorkspace,
+		useOperatingWorkspaceHref
+	} from '$lib/components/operatingWorkspace.svelte'
+	const editRights = useEditRights()
+
+	let {
+		useDrawer = true,
+		inline = false,
+		onClose = undefined,
+		hideTarget = false,
+		description = undefined,
+		isEditor = false,
+		customLabel = undefined,
+		allowDraft = false,
+		isDeployed = false,
+		onConfigChange = undefined,
+		onCaptureConfigChange = undefined,
+		onUpdate = undefined,
+		onDelete = undefined,
+		onReset = undefined,
+		trigger = undefined,
+		customSaveBehavior = undefined
+	} = $props()
+	const operatingWorkspace = useOperatingWorkspace()
+	const operatingUser = useOperatingUser()
+	const actingUser = $derived(operatingUser.current)
+	const operatingHref = useOperatingWorkspaceHref()
+	const wsId = $derived($operatingWorkspace)
+
+	// Form data state
+	let initialPath = $state('')
+	let edit = $state(true)
+	let itemKind = $state<'flow' | 'script'>('script')
+	let is_flow = $state(false)
+	let script_path = $state('')
+	let initialScriptPath = $state('')
+	let fixedScriptPath = $state('')
+	let path = $state('')
+	let pathError = $state('')
+	let isValid = $state(false)
+	let dirtyLocalPart = $state(false)
+	let dirtyPath = $state(false)
+	let local_part = $state('')
+	let workspaced_local_part = $state(false)
+	let drawerLoading = $state(true)
+	let showLoader = $state(false)
+	let permsPath = $state<string | undefined>(undefined)
+	let permsForWrite = $state<Record<string, boolean> | undefined>(undefined)
+	// The acting user in the operating workspace arrives asynchronously, and an unknown user
+	// refuses — so the editor stays read-only until the lookup lands, which is the safe answer.
+	const can_write = $derived(
+		permsPath === undefined
+			? editRights.roleCanAuthor('trigger')
+			: editRights.canEditItem('trigger', permsPath, permsForWrite)
+	)
+	let extraPerms = $state<Record<string, boolean> | undefined>(undefined)
+	let errorHandler = $state(handlerDraftFromStored('error', undefined))
+	const storedErrorHandler = $derived(handlerDraftToStored(errorHandler))
+	const error_handler_path = $derived(storedErrorHandler.path)
+	const error_handler_args = $derived(storedErrorHandler.args)
+	let retry: Retry | undefined = $state()
+	let mode = $state<TriggerMode>('enabled')
+	// Component references
+	let drawer = $state<Drawer | undefined>(undefined)
+	let initialConfig: NewEmailTrigger | undefined = undefined
+	let deploymentLoading = $state(false)
+	let permissionedAs = $state<string | undefined>(undefined)
+	let selectedPermissionedAs = $state<string | undefined>(undefined)
+	let preservePermissionedAs = $state(false)
+	let optionTabSelected: 'error_handler' | 'retries' = $state('error_handler')
+
+	let suspendedJobsModal = $state<TriggerSuspendedJobsModal | null>(null)
+	let originalConfig = $state<NewEmailTrigger | undefined>(undefined)
+
+	let hasChanged = $derived(!deepEqual(getEmailTriggerConfig(), originalConfig ?? {}))
+	const isAdmin = $derived(actingUser?.is_admin || actingUser?.is_super_admin)
+	const emailConfig = $derived.by(getEmailTriggerConfig)
+
+	const draftSync = useTriggerDraftSync({
+		itemKind: 'trigger_email',
+		path: () => initialPath,
+		workspace: () => wsId,
+		drawerLoading: () => drawerLoading,
+		getCfg: () => emailConfig,
+		applyCfg: (c) => loadTriggerConfig(c as Partial<EmailTrigger>),
+		deployed: () => originalConfig
+	})
+	const captureConfig = $derived.by(untrack(() => isEditor) ? getCaptureConfig : () => ({}))
+	const saveDisabled = $derived(
+		drawerLoading ||
+			!can_write ||
+			pathError != '' ||
+			!isValid ||
+			emptyString(script_path) ||
+			!hasChanged
+	)
+
+	$effect(() => {
+		is_flow = itemKind === 'flow'
+	})
+
+	// Set by `openNew(…, { onSaveDraft })`: the caller keeps the trigger as its own
+	// draft, so Save hands it the config instead of writing it.
+	let saveDraftHandler: ((cfg: Record<string, any>) => boolean) | undefined = $state(undefined)
+
+	export async function openEdit(
+		ePath: string,
+		isFlow: boolean,
+		defaultConfig?: Partial<NewEmailTrigger>,
+		fixedScriptPath_?: string
+	) {
+		saveDraftHandler = undefined
+		// A `whoami` that failed earlier would otherwise pin this workspace to "unknown user".
+		operatingUser.forgetFailures()
+		editRights.forgetFailures()
+		drawerLoading = true
+		let loader = setTimeout(() => {
+			showLoader = true
+		}, 100) // if loading takes less than 100ms, we don't show the loader
+		try {
+			drawer?.openDrawer()
+			setPageDrawerAnchor(TRIGGER_PAGES.email.path, ePath)
+			initialPath = ePath
+			path = ePath
+			itemKind = isFlow ? 'flow' : 'script'
+			edit = true
+			dirtyPath = false
+			dirtyLocalPart = false
+			fixedScriptPath = fixedScriptPath_ ?? ''
+			const { overlay: draftOverlay, noDeployed } = await loadTrigger(defaultConfig)
+			// Draft-only triggers open as "new trigger prefilled from the
+			// draft" — no deployed row exists, so saving must CREATE (the
+			// update endpoint 404s).
+			edit = !noDeployed
+			// Form holds DEPLOYED here. Capture `originalConfig` as the
+			// deployed baseline so `hasChanged` (= current != originalConfig)
+			// fires whenever a draft exists, not only after the user edits.
+			originalConfig = structuredClone($state.snapshot(getEmailTriggerConfig())) as NewEmailTrigger
+			if (draftOverlay) loadTriggerConfig(draftOverlay as Partial<EmailTrigger>)
+			if (!defaultConfig) {
+				// If the email trigger is loaded from the backend, we to set the initial config
+				initialConfig = structuredClone($state.snapshot(getEmailTriggerConfig())) as NewEmailTrigger
+			}
+			await draftSync.maybeRestore()
+		} catch (err) {
+			sendUserToast(`Could not load email trigger: ${err}`, true)
+		} finally {
+			clearTimeout(loader)
+			drawerLoading = false
+			showLoader = false
+		}
+	}
+
+	export async function openNew(
+		nis_flow: boolean,
+		fixedScriptPath_?: string,
+		defaultValues?: Partial<EmailTrigger>,
+		opts: {
+			onSaveDraft?: (cfg: Record<string, any>) => boolean
+			/** A config this editor saved before, re-applied over the defaults. */
+			draftConfig?: Record<string, any>
+		} = {}
+	) {
+		saveDraftHandler = opts.onSaveDraft
+		drawerLoading = true
+		let loader = setTimeout(() => {
+			showLoader = true
+		}, 100) // if loading takes less than 100ms, we don't show the loader
+		try {
+			drawer?.openDrawer()
+			is_flow = defaultValues?.is_flow ?? nis_flow
+			edit = false
+			itemKind = nis_flow ? 'flow' : 'script'
+			local_part = defaultValues?.local_part ?? ''
+			dirtyLocalPart = false
+			initialScriptPath = ''
+			fixedScriptPath = fixedScriptPath_ ?? ''
+			script_path = fixedScriptPath
+			path = defaultValues?.path ?? ''
+			initialPath = ''
+			dirtyPath = false
+
+			workspaced_local_part = defaultValues?.workspaced_local_part ?? false
+			errorHandler = handlerDraftFromStored(
+				'error',
+				defaultValues?.error_handler_path,
+				'script',
+				defaultValues?.error_handler_args
+			)
+			retry = defaultValues?.retry ?? undefined
+			mode = defaultValues?.mode ?? 'enabled'
+			permissionedAs = undefined
+			selectedPermissionedAs = undefined
+			preservePermissionedAs = false
+			originalConfig = undefined
+			if (opts.draftConfig) await loadTriggerConfig(opts.draftConfig as Partial<EmailTrigger>)
+		} finally {
+			clearTimeout(loader)
+			drawerLoading = false
+			showLoader = false
+		}
+	}
+
+	function loadTriggerConfig(cfg?: Partial<EmailTrigger>): void {
+		// The loaded trigger says what it runs; an opener's `isFlow` is only its guess.
+		if (cfg?.is_flow !== undefined) itemKind = cfg.is_flow ? 'flow' : 'script'
+		script_path = cfg?.script_path ?? ''
+		initialScriptPath = cfg?.script_path ?? ''
+		is_flow = cfg?.is_flow ?? false
+		path = cfg?.path ?? ''
+		local_part = cfg?.local_part ?? ''
+		workspaced_local_part = cfg?.workspaced_local_part ?? false
+		extraPerms = cfg?.extra_perms ?? undefined
+		permsPath = path
+		permsForWrite = cfg?.extra_perms ?? {}
+		errorHandler = handlerDraftFromStored(
+			'error',
+			cfg?.error_handler_path,
+			'script',
+			cfg?.error_handler_args
+		)
+		retry = cfg?.retry
+		mode = cfg?.mode ?? 'enabled'
+		permissionedAs = cfg?.permissioned_as
+		selectedPermissionedAs = cfg?.permissioned_as
+		preservePermissionedAs = !!cfg?.permissioned_as
+	}
+
+	/**
+	 * Apply the deployed config to the form, then return the saved-draft
+	 * overlay (if any) so the caller can capture the deployed-only form
+	 * state as `originalConfig` BEFORE applying the draft. See
+	 * `NatsTriggerEditorInner` for the rationale.
+	 */
+	async function loadTrigger(
+		defaultConfig?: Partial<EmailTrigger>
+	): Promise<{ overlay: Record<string, any> | undefined; noDeployed: boolean }> {
+		if (defaultConfig) {
+			loadTriggerConfig(defaultConfig)
+			return { overlay: undefined, noDeployed: false }
+		}
+		const s = await EmailTriggerService.getEmailTrigger({
+			workspace: wsId!,
+			path: initialPath,
+			getDraft: true
+		})
+		const { draft: draftFromBackend, ...deployedTrigger } = (s ?? {}) as any
+		loadTriggerConfig(deployedTrigger)
+		return {
+			noDeployed: !!(s as any)?.no_deployed,
+			overlay: draftFromBackend
+				? ({ ...deployedTrigger, ...draftFromBackend } as Record<string, any>)
+				: undefined
+		}
+	}
+
+	async function triggerScript(): Promise<void> {
+		if (saveDraftHandler) {
+			if (!saveDraftHandler($state.snapshot(getEmailTriggerConfig()))) return
+			drawer?.closeDrawer()
+			return
+		}
+		if (customSaveBehavior) {
+			customSaveBehavior(emailConfig)
+			drawer?.closeDrawer()
+		} else {
+			deploymentLoading = true
+			const previousPath = initialPath
+			const saveCfg = emailConfig
+			const isSaved = await saveEmailTriggerFromCfg(
+				initialPath,
+				saveCfg,
+				edit,
+				wsId!,
+				!!actingUser?.is_admin || !!actingUser?.is_super_admin,
+				usedTriggerKinds
+			)
+			if (isSaved) {
+				draftSync.discard(previousPath, getEmailTriggerConfig())
+				onUpdate(saveCfg.path)
+				originalConfig = structuredClone($state.snapshot(getEmailTriggerConfig()))
+				initialPath = saveCfg.path
+				initialScriptPath = saveCfg.script_path
+				if (mode !== 'suspended') {
+					drawer?.closeDrawer()
+				}
+			}
+			deploymentLoading = false
+		}
+	}
+
+	function getEmailTriggerConfig(): NewEmailTrigger {
+		const nCfg = {
+			script_path,
+			is_flow,
+			path,
+			local_part,
+			workspaced_local_part,
+			extra_perms: extraPerms,
+			error_handler_path,
+			error_handler_args,
+			retry,
+			mode,
+			permissioned_as: selectedPermissionedAs,
+			preserve_permissioned_as: preservePermissionedAs || undefined
+		}
+
+		return nCfg
+	}
+
+	async function handleToggleMode(newMode: TriggerMode) {
+		mode = newMode
+		if (!trigger?.draftConfig) {
+			// Email addresses are always workspace-prefixed (clone filter
+			// excludes workspaced_local_part=false) — no fork-conflict warning.
+			await EmailTriggerService.setEmailTriggerMode({
+				path: initialPath,
+				workspace: wsId ?? '',
+				requestBody: { mode: newMode }
+			})
+			sendUserToast(`${capitalize(newMode)} email trigger ${initialPath}`)
+
+			onUpdate(initialPath)
+		}
+		if (originalConfig) {
+			originalConfig['mode'] = newMode
+		}
+	}
+
+	// Update config for captures
+	function getCaptureConfig() {
+		const newCaptureConfig = {
+			local_part: emailConfig.local_part,
+			path: emailConfig.path
+		}
+		//
+		return newCaptureConfig
+	}
+
+	$effect(() => {
+		const args = [captureConfig, isValid] as const
+		untrack(() => onCaptureConfigChange?.(...args))
+	})
+
+	$effect(() => {
+		if (!drawerLoading) {
+			handleConfigChange(emailConfig, initialConfig, saveDisabled, edit, onConfigChange)
+		}
+	})
+</script>
+
+{#if mode === 'suspended'}
+	<TriggerSuspendedJobsModal
+		bind:this={suspendedJobsModal}
+		triggerPath={path}
+		triggerKind="email"
+		{hasChanged}
+		onToggleMode={handleToggleMode}
+		runnableConfig={{
+			path: script_path,
+			kind: itemKind,
+			retry,
+			errorHandlerPath: error_handler_path,
+			errorHandlerArgs: error_handler_args
+		}}
+	/>
+{/if}
+
+{#snippet config()}
+	{#if drawerLoading}
+		{#if showLoader}
+			<Loader2 class="animate-spin" />
+		{/if}
+	{:else}
+		<PermissionedAsLine
+			{permissionedAs}
+			disabled={!can_write}
+			{path}
+			onPermissionedAsChange={(pa, preserve) => {
+				selectedPermissionedAs = pa
+				preservePermissionedAs = preserve
+			}}
+		/>
+		<div class="flex flex-col gap-12">
+			{#if mode === 'suspended'}
+				<TriggerSuspendedJobsAlert {suspendedJobsModal} />
+			{/if}
+			<Section headless>
+				<div class="flex flex-col gap-2">
+					<Label label="Path">
+						<Path
+							workspaceOverride={wsId}
+							bind:dirty={dirtyPath}
+							bind:error={pathError}
+							bind:path
+							{initialPath}
+							checkInitialPathExistence={!edit}
+							namePlaceholder="email_trigger"
+							kind="email_trigger"
+							hideUser
+							disableEditing={!can_write}
+						/>
+					</Label>
+				</div>
+			</Section>
+
+			{#if !hideTarget}
+				<Section label="Target">
+					<TriggerRunnablePicker
+						workspace={wsId}
+						{fixedScriptPath}
+						bind:itemKind
+						bind:scriptPath={script_path}
+						{initialScriptPath}
+						canWrite={can_write}
+						allowEdit={editRights.roleCanAuthor(itemKind)}
+						promptClass="text-xs mt-3 mb-1 text-primary"
+					>
+						{#snippet createButton()}
+							{#if emptyString(script_path)}
+								<Button
+									btnClasses="ml-4"
+									variant="accent"
+									size="xs"
+									href={operatingHref(
+										itemKind === 'flow' ? '/flows/add?hub=72' : '/scripts/add?hub=hub%2F19813'
+									)}
+									target="_blank">Create from template</Button
+								>
+							{/if}
+						{/snippet}
+					</TriggerRunnablePicker>
+				</Section>
+			{/if}
+
+			<EmailTriggerEditorConfigSection
+				initialTriggerPath={initialPath}
+				bind:local_part
+				bind:isValid
+				bind:workspaced_local_part
+				bind:dirtyLocalPart
+				{can_write}
+				showTestingBadge={isEditor}
+				isDraftOnly={trigger ? trigger.isDraft : false}
+			/>
+
+			<Section label="Advanced" collapsable>
+				{#snippet header()}
+					<TriggerAdvancedBadges {error_handler_path} {retry} />
+				{/snippet}
+				<div class="flex flex-col gap-6">
+					<div class="min-h-96">
+						<Tabs bind:selected={optionTabSelected}>
+							<Tab value="error_handler" label="Error Handler" />
+							<Tab value="retries" label="Retries" />
+						</Tabs>
+						<div class="mt-4">
+							<TriggerRetriesAndErrorHandler
+								workspace={wsId}
+								{optionTabSelected}
+								{itemKind}
+								{can_write}
+								bind:errorHandler
+								bind:retry
+							/>
+						</div>
+					</div>
+				</div>
+			</Section>
+			<div class="pb-8" />
+		</div>
+	{/if}
+{/snippet}
+
+{#snippet saveButton()}
+	{#if !drawerLoading}
+		<TriggerEditorToolbar
+			triggerKind="email"
+			triggerPath={initialPath}
+			{trigger}
+			permissions={drawerLoading || !can_write ? 'none' : can_write && isAdmin ? 'create' : 'write'}
+			{saveDisabled}
+			{allowDraft}
+			{edit}
+			isLoading={deploymentLoading}
+			onUpdate={triggerScript}
+			saveLabel={saveDraftHandler ? 'Save draft' : undefined}
+			{onReset}
+			{onDelete}
+			{isDeployed}
+			{mode}
+			onToggleMode={handleToggleMode}
+			{suspendedJobsModal}
+		/>
+	{/if}
+{/snippet}
+
+{#snippet drawerBody()}
+	<DrawerContent
+		hideClose={inline && !onClose}
+		fullScreen={!inline}
+		bannerReserved={draftSync.hasBaseline}
+		title={edit
+			? can_write
+				? `Edit email trigger ${initialPath}`
+				: `Email trigger ${initialPath}`
+			: saveDraftHandler
+				? 'Draft email trigger'
+				: 'New email trigger'}
+		on:close={() => (inline ? onClose?.() : drawer?.closeDrawer())}
+	>
+		{#snippet actions()}
+			{@render saveButton()}
+		{/snippet}
+		{#snippet banner()}
+			<LocalDraftBanner
+				show={draftSync.hasDraft}
+				getDeployed={() => draftSync.deployed}
+				reserveSpace={draftSync.hasBaseline}
+				getCurrent={() => draftSync.current}
+				onDiscard={() => draftSync.resetToDeployed(initialPath)}
+				disabled={!can_write}
+			/>
+		{/snippet}
+		{@render config()}
+	</DrawerContent>
+{/snippet}
+
+{#if useDrawer && inline}
+	{@render drawerBody()}
+{:else if useDrawer}
+	<Drawer
+		size="700px"
+		bind:this={drawer}
+		on:close={() => clearPageDrawerAnchor(TRIGGER_PAGES.email.path)}
+	>
+		{@render drawerBody()}
+	</Drawer>
+{:else}
+	<Section label={!customLabel ? 'Email trigger' : ''} headerClass="grow min-w-0 h-[30px]">
+		{#snippet header()}
+			{#if customLabel}
+				{@render customLabel()}
+			{/if}
+		{/snippet}
+		{#snippet action()}
+			{@render saveButton()}
+		{/snippet}
+		{#if description}
+			{@render description()}
+		{/if}
+		{@render config()}
+	</Section>
+{/if}

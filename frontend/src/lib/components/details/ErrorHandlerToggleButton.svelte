@@ -1,0 +1,64 @@
+<script lang="ts">
+	import { Bell, BellOff } from 'lucide-svelte'
+
+	import { Button } from '$lib/components/common'
+	import Tooltip from '../Tooltip.svelte'
+	import { toggleWorkspaceErrorHandler } from './errorHandlerToggle'
+	import { useOperatingWorkspace } from '$lib/components/operatingWorkspace.svelte'
+
+	const operatingWorkspace = useOperatingWorkspace()
+
+	interface Props {
+		kind: 'script' | 'flow'
+		scriptOrFlowPath: string
+		errorHandlerMuted: boolean | undefined
+		iconOnly?: boolean
+		unifiedSize?: 'xs' | 'sm' | 'md' | 'lg'
+	}
+
+	let {
+		kind,
+		scriptOrFlowPath,
+		errorHandlerMuted = $bindable(),
+		iconOnly = true,
+		unifiedSize = 'md'
+	}: Props = $props()
+
+	async function toggleErrorHandler(): Promise<void> {
+		const next = await toggleWorkspaceErrorHandler(
+			$operatingWorkspace,
+			kind,
+			scriptOrFlowPath,
+			errorHandlerMuted
+		)
+		if (next !== undefined) errorHandlerMuted = next
+	}
+</script>
+
+<Button
+	title={errorHandlerMuted === undefined || !errorHandlerMuted
+		? 'Disable workspace error handler for this script'
+		: 'Enable workspace error handler for this script'}
+	{unifiedSize}
+	on:click={toggleErrorHandler}
+	variant="subtle"
+	startIcon={{
+		icon: errorHandlerMuted === undefined || !errorHandlerMuted ? Bell : BellOff
+	}}
+	{iconOnly}
+>
+	{#if errorHandlerMuted === undefined || !errorHandlerMuted}
+		<div class="flex flex-row items-center">
+			{#if !iconOnly}
+				Mute
+			{/if}
+		</div>
+	{:else}
+		<div class="flex flex-row items-center">
+			{#if !iconOnly}
+				Unmute
+			{/if}
+		</div>
+	{/if}
+	<Tooltip>Disable workspace error handler, EE only</Tooltip>
+</Button>

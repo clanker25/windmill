@@ -1,0 +1,524 @@
+<script lang="ts">
+	import { goto } from '$lib/navigation'
+	import Dropdown from '$lib/components/DropdownV2.svelte'
+	import type MoveDrawer from '$lib/components/MoveDrawer.svelte'
+	import ScheduleEditor from '$lib/components/triggers/schedules/ScheduleEditor.svelte'
+	import SharedBadge from '$lib/components/SharedBadge.svelte'
+	import DraftBadge from '$lib/components/DraftBadge.svelte'
+	import type ShareModal from '$lib/components/ShareModal.svelte'
+
+	import { ScriptService, type Script } from '$lib/gen'
+	import {
+		disableHubStore,
+		hubBaseUrlStore,
+		roleCapabilities,
+		userStore,
+		userWorkspaces,
+		workspaceStore
+	} from '$lib/stores'
+	import { scriptToHubUrl } from '$lib/hub'
+	import { UserDraftDbSyncer } from '$lib/userDraftDbSyncer.svelte'
+
+	import { createEventDispatcher } from 'svelte'
+	import Badge from '../badge/Badge.svelte'
+	import Button from '../button/Button.svelte'
+	import Row from './Row.svelte'
+	import { selectMenuItems, type RowSelection } from './rowSelection'
+	import { sendUserToast } from '$lib/toast'
+	import { capitalize, copyToClipboard, isOwner } from '$lib/utils'
+	import { isDeployable } from '$lib/utils_deployable'
+
+	import type DeployWorkspaceDrawer from '$lib/components/DeployWorkspaceDrawer.svelte'
+	import LanguageTag from '../languageIcons/LanguageTag.svelte'
+	import {
+		Archive,
+		Calendar,
+		Code,
+		Copy,
+		Eye,
+		FolderOpen,
+		ChevronUpSquare,
+		GitFork,
+		Globe2,
+		List,
+		Pen,
+		Shield,
+		Trash,
+		History,
+		FileText,
+		Clock,
+		Send
+	} from 'lucide-svelte'
+	import ScriptVersionHistory from '$lib/components/ScriptVersionHistory.svelte'
+	import WacExportDrawer from '$lib/components/scripts/WacExportDrawer.svelte'
+	import { Drawer, DrawerContent } from '..'
+	import NoMainFuncBadge from '$lib/components/NoMainFuncBadge.svelte'
+	import RowLabels from './RowLabels.svelte'
+	import AskAiRowButton from './AskAiRowButton.svelte'
+	import Popover from '$lib/components/Popover.svelte'
+	import Tooltip from '$lib/components/Tooltip.svelte'
+	import { cachedDeployUiSettings, warmDeployUiSettings } from '$lib/components/home/deploy_ui'
+	import { menuGroups, submenu } from './menuGroups'
+	import {
+		claimTab,
+		editInForkAllowed,
+		editInForkLabel,
+		onEditInForkClick
+	} from '$lib/utils/editInFork'
+	import EditInForkButton from './EditInForkButton.svelte'
+	import { isCloudHosted } from '$lib/cloud'
+
+	interface Props {
+		script: Script & {
+			canWrite: boolean
+			use_codebase: boolean
+			is_draft?: boolean
+			draft_path?: string
+			draft_users?: { username?: string | null }[]
+		}
+		marked: string | undefined
+		shareModal: ShareModal
+		moveDrawer: MoveDrawer
+		deploymentDrawer: DeployWorkspaceDrawer
+		deleteConfirmedCallback: (() => void) | undefined
+		errorHandlerMuted: boolean
+		showCode: (path: string, summary: string) => void
+		depth?: number
+		menuOpen?: boolean
+		showEditButton?: boolean
+		keyboardSelected?: boolean
+		rowSelection?: RowSelection
+	}
+
+	let {
+		script,
+		marked,
+		shareModal,
+		moveDrawer,
+		deploymentDrawer,
+		deleteConfirmedCallback = $bindable(),
+		errorHandlerMuted,
+		showCode,
+		depth = 0,
+		menuOpen = $bindable(false),
+		showEditButton = $bindable(true),
+		keyboardSelected = false,
+		rowSelection = undefined
+	}: Props = $props()
+
+	const dispatch = createEventDispatcher()
+
+	warmDeployUiSettings()
+
+	async function archiveScript(path: string): Promise<void> {
+		await ScriptService.archiveScriptByPath({ workspace: $workspaceStore!, path })
+		dispatch('change')
+		sendUserToast(`Archived script ${path}`)
+	}
+
+	async function unarchiveScript(path: string): Promise<void> {
+		const r = await ScriptService.getScriptByPath({ workspace: $workspaceStore!, path })
+		await ScriptService.createScript({
+			workspace: $workspaceStore!,
+			requestBody: {
+				...r,
+				parent_hash: r.hash,
+				lock: r.lock
+			}
+		})
+		dispatch('change')
+		sendUserToast(`Unarchived script ${path}`)
+	}
+
+	async function deleteScript(path: string): Promise<void> {
+		// Draft-only items have no deployed row to delete — the regular
+		// route would 404. Route the delete through the syncer so the
+		// per-user draft row is removed instead.
+		if (script.draft_only) {
+			await UserDraftDbSyncer.save({
+				workspace: $workspaceStore!,
+				itemKind: 'script',
+				path,
+				value: null,
+				immediate: true
+			})
+		} else {
+			await ScriptService.deleteScriptByPath({ workspace: $workspaceStore!, path })
+		}
+		dispatch('change')
+		sendUserToast(`Deleted script ${path}`)
+	}
+	let scheduleEditor: ScheduleEditor | undefined = $state(undefined)
+
+	const dlt: 'delete' = 'delete'
+	let versionsDrawerOpen: boolean = $state(false)
+	let wacExportDrawer: WacExportDrawer | undefined = $state(undefined)
+</script>
+
+{#if menuOpen}
+	<ScheduleEditor onUpdate={() => goto('/schedules')} bind:this={scheduleEditor} />
+{/if}
+
+<Row
+	aiId={`script-run-button-${script.path}`}
+	aiDescription={`Button to access the form to run the script ${script.summary ?? script.path}`}
+	href={script.draft_only || (script.auto_kind === 'lib' && script.kind !== 'preprocessor')
+		? `/scripts/edit/${script.path}`
+		: `/scripts/get/${script.hash}?workspace=${$workspaceStore}`}
+	kind="script"
+	{keyboardSelected}
+	{marked}
+	path={script.draft_path ?? script.path}
+	summary={script.is_draft
+		? `${script.summary || script.draft_path || script.path}*`
+		: script.summary}
+	{errorHandlerMuted}
+	workspaceId={$workspaceStore ?? ''}
+	canFavorite={!script.draft_only}
+	{depth}
+	{rowSelection}
+>
+	{#snippet badges()}
+		{#if script.lock_error_logs}
+			<Badge color="red" baseClass="border border-red-200">Deployment failed</Badge>
+		{/if}
+
+		{#if script.archived}
+			<Badge color="red" baseClass="border">Archived</Badge>
+		{/if}
+
+		{#if script.auto_kind === 'lib' && script.kind !== 'preprocessor'}
+			<NoMainFuncBadge />
+		{/if}
+		{#if script.auto_kind === 'wac'}
+			<Popover notClickable>
+				{#snippet text()}
+					Workflow-as-Code
+				{/snippet}
+				<Badge small color="indigo" baseClass="border border-indigo-200">wac</Badge>
+			</Popover>
+		{/if}
+		{#if script.auto_kind === 'test'}
+			<Popover notClickable>
+				{#snippet text()}
+					CI test script
+				{/snippet}
+				<Badge small color="yellow" baseClass="border">CI test</Badge>
+			</Popover>
+		{/if}
+		<!-- Guard on a non-empty kind: a draft-only script can carry an empty `kind`, which
+		     still isn't 'script' and would render an empty blue badge. -->
+		{#if script.kind && script.kind !== 'script'}
+			<Badge color="blue" baseClass="border"
+				>{script.kind === 'failure' ? 'Error handler' : capitalize(script.kind)}</Badge
+			>
+		{/if}
+		<SharedBadge canWrite={script.canWrite} extraPerms={script.extra_perms} />
+		<RowLabels labels={script.labels} inherited={script.inherited_labels} />
+		<!-- Last, so the draft badges line up down the list whatever labels each row has. -->
+		<DraftBadge
+			is_draft={script.is_draft}
+			draft_only={script.draft_only}
+			draft_users={script.draft_users}
+			currentUsername={$userStore?.username}
+			workspace={$workspaceStore ?? undefined}
+			itemKind="script"
+			path={script.path}
+			onMigrated={() => dispatch('change')}
+		/>
+	{/snippet}
+
+	{#snippet titleBadge()}
+		<LanguageTag lang={script.language} />
+	{/snippet}
+
+	{#snippet actions()}
+		<span class="hidden md:inline-flex">
+			<AskAiRowButton kind="script" path={script.path} summary={script.summary} />
+			{#if $roleCapabilities.code}
+				{#if showEditButton}
+					{#if script.use_codebase}
+						<Badge
+							>bundle<Tooltip
+								>This script is deployed as a bundle and can only be deployed from the CLI for now</Tooltip
+							></Badge
+						>
+					{:else if script.canWrite && !script.archived}
+						<div>
+							<Button
+								aiId={`edit-script-button-${script.summary?.length > 0 ? script.summary : script.path}`}
+								aiDescription={`Edits the script ${script.summary?.length > 0 ? script.summary : script.path}`}
+								variant="subtle"
+								unifiedSize="sm"
+								startIcon={{ icon: Pen }}
+								href="/scripts/edit/{script.path}"
+							>
+								Edit
+							</Button>
+						</div>
+					{/if}
+				{/if}
+				{#if !isCloudHosted() && editInForkAllowed($workspaceStore, $userWorkspaces) && (!showEditButton || !script.canWrite)}
+					<EditInForkButton itemType="script" path={script.path} />
+				{/if}
+			{/if}
+		</span>
+		<Dropdown
+			size="sm"
+			aiId={`script-row-dropdown-${script.summary?.length > 0 ? script.summary : script.path}`}
+			aiDescription={`Open dropdown for script ${script.summary?.length > 0 ? script.summary : script.path} options`}
+			items={() => {
+				let owner = isOwner(script.path, $userStore, $workspaceStore)
+				const canEdit = script.canWrite && showEditButton
+				if (script.draft_only) {
+					return menuGroups(
+						selectMenuItems(rowSelection),
+						[
+							{
+								displayName: 'View code',
+								icon: Code,
+								action: () => {
+									showCode(script.path, script.summary)
+								}
+							},
+							{
+								displayName: 'Move/Rename',
+								icon: FolderOpen,
+								action: () => {
+									// Addressed by the generated path its draft row sits at, but
+									// named by the path typed in the editor.
+									moveDrawer.openDrawer(
+										script.draft_path ?? script.path,
+										script.summary,
+										'script',
+										{
+											storagePath: script.path
+										}
+									)
+								},
+								disabled: !showEditButton,
+								hide: !$roleCapabilities.code
+							}
+						],
+						[
+							{
+								displayName: 'Delete',
+								icon: Trash,
+								action: (event) => {
+									// TODO
+									// @ts-ignore
+									if (event?.shiftKey) {
+										deleteScript(script.path)
+									} else {
+										deleteConfirmedCallback = () => {
+											deleteScript(script.path)
+										}
+									}
+								},
+								type: dlt,
+								// A draft-only row is always the authed user's own draft (the
+								// list endpoint only surfaces own/legacy draft-only rows), so
+								// discarding it never requires write permission on the path.
+								disabled: !showEditButton
+							}
+						]
+					)
+				}
+				return menuGroups(
+					selectMenuItems(rowSelection),
+					[
+						{
+							displayName: 'View code',
+							icon: Code,
+							action: () => {
+								showCode(script.path, script.summary)
+							}
+						},
+						{
+							displayName: 'View JSON/YAML',
+							icon: FileText,
+							action: async () => {
+								const fullScript = await ScriptService.getScriptByPath({
+									workspace: $workspaceStore!,
+									path: script.path
+								})
+								wacExportDrawer?.open(fullScript)
+							},
+							hide: script.auto_kind !== 'wac'
+						},
+						{
+							displayName: 'View runs',
+							icon: List,
+							href: `/runs/${script.path}`
+						},
+						submenu('History', Clock, [
+							{
+								displayName: 'Versions',
+								icon: History,
+								action: () => {
+									versionsDrawerOpen = true
+								}
+							},
+							{
+								displayName: 'Audit logs',
+								icon: Eye,
+								href: `/audit_logs?resource=${script.path}`,
+								hide: !$roleCapabilities.code || !$roleCapabilities.visibility.audit_logs
+							}
+						])
+					],
+					[
+						{
+							displayName: 'Duplicate/Fork',
+							icon: GitFork,
+							href: `/scripts/add?template=${script.path}`,
+							disabled: !showEditButton,
+							hide: !$roleCapabilities.code
+						},
+						{
+							displayName: editInForkLabel($workspaceStore, $userWorkspaces),
+							icon: Pen,
+							// No `href`: the handler resolves the destination asynchronously, and a melt
+							// menu item's anchor navigates before a delegated onclick can preventDefault it.
+							action: (e) => onEditInForkClick(e, 'script', script.path),
+							hide:
+								!$roleCapabilities.code ||
+								isCloudHosted() ||
+								!editInForkAllowed($workspaceStore, $userWorkspaces)
+						},
+						{
+							displayName: 'Copy path',
+							icon: Copy,
+							action: () => {
+								copyToClipboard(script.path)
+							}
+						}
+					],
+					[
+						{
+							displayName: 'Move/Rename',
+							icon: FolderOpen,
+							action: () => {
+								moveDrawer.openDrawer(script.path, script.summary, 'script')
+							},
+							disabled: !owner || script.archived || !canEdit,
+							hide: !$roleCapabilities.code
+						},
+						{
+							displayName: 'Schedule',
+							icon: Calendar,
+							action: () => {
+								scheduleEditor?.openNew(false, script.path)
+							},
+							disabled: script.archived,
+							hide: !$roleCapabilities.code || !$roleCapabilities.manage_schedules
+						},
+						{
+							displayName: 'Permissions',
+							icon: Shield,
+							action: () => {
+								shareModal.openDrawer && shareModal.openDrawer(script.path, 'script')
+							},
+							disabled: script.archived,
+							hide: !$roleCapabilities.code
+						},
+						submenu('Deploy & publish', Send, [
+							{
+								displayName: 'Deploy to staging/prod',
+								icon: ChevronUpSquare,
+								action: () => {
+									deploymentDrawer.openDrawer(script.path, 'script')
+								},
+								disabled: script.archived,
+								hide:
+									!$roleCapabilities.code ||
+									!isDeployable('script', script.path, cachedDeployUiSettings())
+							},
+							{
+								displayName: 'Publish to Hub',
+								icon: Globe2,
+								action: async () => {
+									// The row only carries metadata, so the code has to be fetched first; the tab is
+									// claimed before that, since Safari won't open one after an await.
+									const tab = claimTab()
+									try {
+										const fullScript = await ScriptService.getScriptByPath({
+											workspace: $workspaceStore!,
+											path: script.path
+										})
+										const url = scriptToHubUrl(fullScript, $hubBaseUrlStore).toString()
+										if (tab) {
+											tab.show(url)
+										} else if (!window.open(url)) {
+											sendUserToast('Allow popups to publish this script to the Hub', true)
+										}
+									} catch (e: any) {
+										tab?.discard()
+										sendUserToast(
+											`Could not load ${script.path}: ${e?.body ?? e?.message ?? e}`,
+											true
+										)
+									}
+								},
+								// Operators can't write scripts, so they have nothing to publish.
+								hide: $disableHubStore || !$roleCapabilities.code
+							}
+						])
+					],
+					[
+						{
+							displayName: script.archived ? 'Unarchive' : 'Archive',
+							icon: Archive,
+							action: () => {
+								script.archived
+									? script.path && unarchiveScript(script.path)
+									: script.path && archiveScript(script.path)
+							},
+							type: 'delete',
+							disabled: !owner || !canEdit,
+							hide: !$roleCapabilities.code
+						},
+						{
+							displayName: 'Delete',
+							icon: Trash,
+							action: (event) => {
+								if (event?.shiftKey) {
+									deleteScript(script.path)
+								} else {
+									deleteConfirmedCallback = () => {
+										deleteScript(script.path)
+									}
+								}
+							},
+							type: dlt,
+							disabled: !canEdit,
+							hide: !$roleCapabilities.code || !($userStore?.is_admin || $userStore?.is_super_admin)
+						}
+					]
+				)
+			}}
+			on:open={() => {
+				menuOpen = true
+			}}
+		/>
+	{/snippet}
+</Row>
+
+{#if script}
+	<Drawer bind:open={versionsDrawerOpen} size="1200px">
+		<DrawerContent title="Versions History" on:close={() => (versionsDrawerOpen = false)}>
+			<ScriptVersionHistory
+				scriptPath={script.path}
+				openDetails
+				on:openDetails={(e) => {
+					if (script) {
+						goto(`/scripts/get/${e.detail.version}?workspace=${$workspaceStore}`)
+					}
+					versionsDrawerOpen = false
+				}}
+			/>
+		</DrawerContent>
+	</Drawer>
+{/if}
+
+<WacExportDrawer bind:this={wacExportDrawer} />

@@ -1,0 +1,428 @@
+<script lang="ts">
+	import { AppService, FlowService, type OpenFlow, type Script } from '$lib/gen'
+	import { roleCapabilities, userStore, workspaceStore } from '$lib/stores'
+	import { HOME_COLUMN_WIDTH } from '$lib/consts'
+	import { Alert, Button, Drawer, DrawerContent } from '$lib/components/common'
+	import ToggleButtonGroup from '$lib/components/common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from '$lib/components/common/toggleButton-v2/ToggleButton.svelte'
+	import FlowIcon from '$lib/components/home/FlowIcon.svelte'
+	import { getScriptByPath } from '$lib/scripts'
+	import type { HubItem } from '$lib/components/flows/pickers/model'
+	import PickHubScript from '$lib/components/flows/pickers/PickHubScript.svelte'
+	import PickHubFlow from '$lib/components/flows/pickers/PickHubFlow.svelte'
+	import HighlightCode from '$lib/components/HighlightCode.svelte'
+	import { ExternalLink, GitFork, Globe2, Loader2, Code, LayoutDashboard } from 'lucide-svelte'
+	import { hubBaseUrlStore } from '$lib/stores'
+
+	import ItemsList from '$lib/components/home/ItemsList.svelte'
+	import PickHubApp from '$lib/components/flows/pickers/PickHubApp.svelte'
+	import { writable } from 'svelte/store'
+	import type { EditorBreakpoint } from '$lib/components/apps/types'
+	import { setQuery } from '$lib/navigation'
+	import { useReducedMotion } from '$lib/svelte5Utils.svelte'
+	import { page } from '$app/state'
+	import { goto, replaceState } from '$app/navigation'
+	import ForkWorkspaceBanner from '$lib/components/ForkWorkspaceBanner.svelte'
+	import WorkspaceDraftsBanner from '$lib/components/WorkspaceDraftsBanner.svelte'
+	import NoDirectDeployAlert from '$lib/components/NoDirectDeployAlert.svelte'
+	import PageHeaderContent from '$lib/components/PageHeaderContent.svelte'
+	import { useSearchParams } from '$lib/svelte5UtilsKit.svelte'
+	import { z } from 'zod'
+	import HomeAIChat from '$lib/components/home/HomeAIChat.svelte'
+	import { isGlobalAiEnabled } from '$lib/components/copilot/chat/global/gate'
+	import { onMount, untrack } from 'svelte'
+	import OperatorTour from '$lib/components/tutorials/OperatorTour.svelte'
+	import {
+		hasSeenOperatorTour,
+		TOUR_PARAM,
+		TOUR_PARAM_VALUE,
+		TOUR_START_DELAY_MS
+	} from '$lib/components/tutorials/operatorTour'
+
+	type Tab = 'hub' | 'workspace'
+
+	let tab = $state<Tab>('workspace')
+
+	let subtab: 'flow' | 'script' | 'app' | 'agent' = $state('script')
+
+	const searchParams = useSearchParams(z.object({ search: z.string().nullable() }))
+	const getFilter = () => searchParams.search ?? ''
+	const setFilter = (v: string) => (searchParams.search = v === '' ? null : v)
+
+	let flowViewer: Drawer | undefined = $state(undefined)
+	let flowViewerFlow: { flow?: OpenFlow & { id?: number } } | undefined = $state(undefined)
+
+	let appViewer: Drawer | undefined = $state(undefined)
+	let appViewerApp: { app?: any & { id?: number } } | undefined = $state(undefined)
+
+	let codeViewer: Drawer | undefined = $state(undefined)
+	let codeViewerContent: string = $state('')
+	let codeViewerLanguage: Script['language'] = $state('deno')
+	let codeViewerObj: HubItem | undefined = $state(undefined)
+
+	const breakpoint = writable<EditorBreakpoint>('lg')
+
+	async function viewCode(obj: HubItem) {
+		codeViewerContent = ''
+		codeViewerObj = undefined
+		getScriptByPath(obj.path).then(({ content, language }) => {
+			codeViewerContent = content
+			codeViewerLanguage = language
+			codeViewerObj = obj
+		})
+
+		codeViewer?.openDrawer?.()
+	}
+
+	async function viewFlow(obj: { flow_id: number }): Promise<void> {
+		flowViewerFlow = undefined
+		FlowService.getHubFlowById({ id: obj.flow_id }).then((hub) => {
+			delete hub['comments']
+			flowViewerFlow = hub
+		})
+		flowViewer?.openDrawer?.()
+	}
+
+	async function viewApp(obj: { app_id: number }): Promise<void> {
+		appViewerApp = undefined
+		AppService.getHubAppById({ id: obj.app_id }).then((hub) => {
+			delete hub['comments']
+			appViewerApp = hub
+		})
+		appViewer?.openDrawer?.()
+	}
+
+	let showCreateButtons = $state(false)
+
+	// A workspace switch keeps this page mounted and swaps its contents under the reader, which
+	// the mount animation below never covers. Replay it by hand instead of keying the page on the
+	// workspace: a remount would drop the list's own state and refetch what it is already loading.
+	let pageEl: HTMLDivElement | undefined = $state(undefined)
+
+	// Back from AI Sessions the view transition (homeSessionsTransition.svelte.ts) carries the arrival, so
+	// the page skips its own fade-in. Decided once at mount: gating the class on the attribute
+	// instead would start the fade from transparent the moment the transition removes it.
+	const fadeIn =
+		typeof document === 'undefined' || !document.documentElement.dataset.homeSessionsTransition
+	const reducedMotion = useReducedMotion()
+	let animatedWorkspace = $workspaceStore
+	$effect(() => {
+		const ws = $workspaceStore
+		if (ws === animatedWorkspace) return
+		animatedWorkspace = ws
+		untrack(() => {
+			if (!pageEl || reducedMotion.val) return
+			pageEl.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 500, easing: 'ease-out' })
+		})
+	})
+
+	let operatorTour: OperatorTour | undefined = $state(undefined)
+
+	// Delayed so the tabs the first steps point at exist. `runTutorial` refuses while a tour is
+	// already running, which is the guard that matters — the tour ends by telling the operator
+	// to start it again from the menu, so a start has to be possible for the life of the page.
+	function startTour() {
+		setTimeout(() => operatorTour?.runTutorial(), TOUR_START_DELAY_MS)
+	}
+
+	// The sidebar entry asks by URL parameter so it works from any page an operator can be on.
+	// Read reactively rather than on mount: arriving from the menu while already on the home
+	// page is a parameter change, not a new page.
+	$effect(() => {
+		if (page.url.searchParams.get(TOUR_PARAM) !== TOUR_PARAM_VALUE) return
+		const user = $userStore
+		if (!user) return
+		untrack(() => {
+			const url = new URL(page.url)
+			url.searchParams.delete(TOUR_PARAM)
+			replaceState(url, page.state)
+			// Gated here too: the parameter is part of a URL anyone can type, and the tour
+			// describes a home page that only operators see.
+			if (!$roleCapabilities.code) startTour()
+		})
+	})
+
+	onMount(async () => {
+		// Operators get the tour once, and only when they have not been through it: they cannot
+		// create anything, so the home page is the whole product to them and it is worth naming
+		// its three tabs. Anyone who can build gets nothing — they have the create button.
+		if ($roleCapabilities.code || page.url.searchParams.has(TOUR_PARAM)) return
+		if (await hasSeenOperatorTour()) return
+		startTour()
+	})
+</script>
+
+<Drawer bind:this={codeViewer} size="900px">
+	<DrawerContent title={codeViewerObj?.summary ?? ''} on:close={codeViewer.closeDrawer}>
+		{#snippet actions()}
+			<Button
+				href="{$hubBaseUrlStore}/scripts/{codeViewerObj?.app ?? ''}/{codeViewerObj?.ask_id ?? 0}"
+				variant="contained"
+				color="light"
+				size="xs"
+				target="_blank"
+				disabled={codeViewerObj == undefined}
+			>
+				<div class="flex gap-2 items-center">
+					<Globe2 size={18} />
+					View on the Hub
+				</div>
+			</Button>
+			<Button
+				href="/scripts/add?hub={encodeURIComponent(codeViewerObj?.path ?? '')}"
+				startIcon={{ icon: GitFork }}
+				variant="accent"
+				size="xs"
+				disabled={codeViewerObj == undefined}
+			>
+				Fork
+			</Button>
+		{/snippet}
+		{#if codeViewerObj != undefined && codeViewerLanguage != undefined}
+			<HighlightCode language={codeViewerLanguage} code={codeViewerContent} />
+		{:else}
+			<div class="p-2">
+				<Loader2 class="animate-spin" />
+			</div>
+		{/if}
+	</DrawerContent>
+</Drawer>
+
+<Drawer bind:this={flowViewer} size="1200px">
+	<DrawerContent title="Hub flow" on:close={flowViewer.closeDrawer}>
+		{#snippet actions()}
+			<Button
+				href="{$hubBaseUrlStore}/flows/{flowViewerFlow?.flow?.id}"
+				variant="contained"
+				color="light"
+				size="xs"
+				target="_blank"
+				disabled={flowViewerFlow == undefined}
+			>
+				<div class="flex gap-2 items-center">
+					<Globe2 size={18} />
+					View on the Hub
+				</div>
+			</Button>
+
+			<Button
+				href="/flows/add?hub={flowViewerFlow?.flow?.id}"
+				startIcon={{ icon: GitFork }}
+				variant="accent"
+				size="xs"
+				disabled={flowViewerFlow == undefined}
+			>
+				Fork
+			</Button>
+		{/snippet}
+
+		{#if flowViewerFlow?.flow}
+			{#await import('$lib/components/FlowViewer.svelte')}
+				<Loader2 class="animate-spin" />
+			{:then Module}
+				<Module.default flow={flowViewerFlow.flow} />
+			{/await}
+		{:else}
+			<div class="p-2">
+				<Loader2 class="animate-spin" />
+			</div>
+		{/if}
+	</DrawerContent>
+</Drawer>
+
+<Drawer bind:this={appViewer} size="1200px">
+	<DrawerContent title="Hub app" on:close={appViewer.closeDrawer}>
+		{#snippet actions()}
+			<Button
+				href="{$hubBaseUrlStore}/apps/{appViewerApp?.app?.id}"
+				variant="contained"
+				color="light"
+				size="xs"
+				target="_blank"
+				disabled={appViewerApp == undefined}
+			>
+				<div class="flex gap-2 items-center">
+					<Globe2 size={18} />
+					View on the Hub
+				</div>
+			</Button>
+
+			<Button
+				href="/apps/add?hub={appViewerApp?.app?.id}"
+				startIcon={{ icon: GitFork }}
+				variant="accent"
+				disabled={appViewerApp == undefined}
+				size="xs"
+			>
+				Fork
+			</Button>
+		{/snippet}
+
+		{#if appViewerApp?.app}
+			<div class="p-4">
+				{#await import('$lib/components/apps/editor/AppPreview.svelte')}
+					<Loader2 class="animate-spin" />
+				{:then Module}
+					<Module.default
+						app={appViewerApp?.app?.value}
+						appPath="''"
+						{breakpoint}
+						policy={{}}
+						workspace="hub"
+						isEditor={false}
+						context={{
+							username: $userStore?.username ?? 'anonymous',
+							email: $userStore?.email ?? 'anonymous',
+							groups: $userStore?.groups ?? []
+						}}
+						summary={appViewerApp?.app.summary ?? ''}
+						noBackend
+						replaceStateFn={(path) => replaceState(path, page.state)}
+						gotoFn={(path, opt) => goto(path, opt)}
+					/>
+				{/await}
+			</div>
+		{/if}
+	</DrawerContent>
+</Drawer>
+
+{#snippet editRuleBadge()}
+	<NoDirectDeployAlert onUpdateCanEditStatus={(v) => (showCreateButtons = v)} />
+{/snippet}
+
+<div
+	bind:this={pageEl}
+	class="{fadeIn ? 'wm-page-in' : ''} flex flex-col w-full h-full overflow-y-auto items-center"
+	style="scrollbar-gutter: stable both-edges;"
+>
+	<!-- Where edits to this workspace are made is a fact about the workspace, so it sits in the
+	     header with the workspace's own name rather than above the list. -->
+	<PageHeaderContent actions={editRuleBadge} />
+
+	<ForkWorkspaceBanner />
+	<WorkspaceDraftsBanner />
+	<div class="{HOME_COLUMN_WIDTH} px-4 sm:px-8 md:px-8 h-fit w-full mb-6 shrink-0">
+		<!-- HomeAIChat carries both the AI composer and the AI-independent CLI/MCP connect row,
+		     so it shows whenever the sessions beta is on; the composer itself is gated on the
+		     workspace inside the component, which owns its own vertical spacing
+		     because the hero and the bare connect row want different amounts of it. -->
+		{#if isGlobalAiEnabled()}
+			<HomeAIChat />
+		{/if}
+
+		{#if $workspaceStore == 'admins'}
+			<Alert title="Admins workspace">
+				The Admins workspace is for admins only and contains scripts whose purpose is to manage your
+				Windmill instance, such as keeping resource types up to date.
+			</Alert>
+			<div class="my-4"></div>
+		{/if}
+
+		{#if tab == 'hub'}
+			<div class="flex flex-col gap-y-16">
+				<div class="flex flex-col pb-8">
+					{#snippet toggleKinds()}
+						<ToggleButtonGroup
+							bind:selected={subtab}
+							onSelected={(v) => {
+								setQuery('kind', v, window.location.hash)
+							}}
+							noWFull
+						>
+							{#snippet children({ item })}
+								<ToggleButton value="script" label="Scripts" icon={Code} {item} />
+								<ToggleButton
+									value="flow"
+									label="Flows"
+									icon={FlowIcon}
+									selectedColor="#14b8a6"
+									{item}
+								/>
+								<ToggleButton
+									value="app"
+									label="Apps"
+									icon={LayoutDashboard}
+									selectedColor="#fb923c"
+									{item}
+								/>
+							{/snippet}
+						</ToggleButtonGroup>
+						<Button
+							startIcon={{ icon: ExternalLink }}
+							target="_blank"
+							href={$hubBaseUrlStore}
+							variant="default"
+						>
+							Hub
+						</Button>
+					{/snippet}
+
+					{#if subtab == 'script'}
+						<PickHubScript
+							syncQuery
+							bind:filter={getFilter, setFilter}
+							on:pick={(e) => viewCode(e.detail)}
+						>
+							{#snippet children()}
+								{@render toggleKinds?.()}
+							{/snippet}
+						</PickHubScript>
+					{:else if subtab == 'flow'}
+						<PickHubFlow
+							syncQuery
+							bind:filter={getFilter, setFilter}
+							on:pick={(e) => viewFlow(e.detail)}
+						>
+							{#snippet children()}
+								{@render toggleKinds?.()}
+							{/snippet}
+						</PickHubFlow>
+					{:else if subtab == 'app'}
+						<PickHubApp
+							syncQuery
+							bind:filter={getFilter, setFilter}
+							on:pick={(e) => viewApp(e.detail)}
+						>
+							{#snippet children()}
+								{@render toggleKinds?.()}
+							{/snippet}
+						</PickHubApp>
+					{/if}
+				</div>
+			</div>
+		{/if}
+	</div>
+
+	{#if tab == 'workspace'}
+		<ItemsList bind:subtab showEditButtons={showCreateButtons} />
+	{/if}
+</div>
+
+{#if !$roleCapabilities.code}
+	<OperatorTour bind:this={operatorTour} />
+{/if}
+
+<style>
+	/* The page's content arriving, rather than being there. The layout has already painted the
+	   sidebar and the surface behind it, so only what is new to this route fades. It plays on
+	   every arrival at Home, not just the one off a workspace hand-over — that is the arrival it
+	   is for, and a soft one costs nothing on the others. */
+	@keyframes wm-page-in {
+		from {
+			opacity: 0;
+		}
+		to {
+			opacity: 1;
+		}
+	}
+
+	.wm-page-in {
+		animation: wm-page-in 500ms ease-out both;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.wm-page-in {
+			animation: none;
+		}
+	}
+</style>

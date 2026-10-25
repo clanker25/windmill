@@ -1,0 +1,750 @@
+<script lang="ts">
+	import { createEventDispatcher, untrack } from 'svelte'
+	import {
+		agentResourceDependencies,
+		aiAgentModuleDependencies,
+		collectTransformRefs
+	} from './deployDependencies'
+	import { enterpriseLicense, superadmin } from '$lib/stores'
+	import {
+		AppService,
+		FlowService,
+		ResourceService,
+		ScheduleService,
+		UserService,
+		WorkspaceService,
+		type RemoteDeployStatus
+	} from '$lib/gen'
+	import { remoteDeployLabel, remoteDeployWorkspace } from '$lib/remoteDeploy'
+	import RemoteDeployConnect from './RemoteDeployConnect.svelte'
+	import ToggleButtonGroup from './common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from './common/toggleButton-v2/ToggleButton.svelte'
+	import TextInput from './text_input/TextInput.svelte'
+	import { getAllModules } from './flows/flowExplorer'
+	import Button from './common/button/Button.svelte'
+	import Tooltip from './Tooltip.svelte'
+	import Alert from './common/alert/Alert.svelte'
+	import { DiffIcon, FileJson, Loader2 } from 'lucide-svelte'
+	import Badge from './common/badge/Badge.svelte'
+	import DiffDrawer from './DiffDrawer.svelte'
+	import {
+		getTriggerDependency,
+		type AdditionalInformation,
+		type Kind
+	} from '$lib/utils_deployable'
+	import {
+		checkItemExists,
+		deployItem,
+		getItemValue,
+		getOnBehalfOf
+	} from '$lib/utils_workspace_deploy'
+	import type { App } from './apps/types'
+	import { getAllGridItems } from './apps/editor/appUtils'
+	import { isRunnableByPath } from './apps/inputType'
+	import type { Runnable } from './raw_apps/utils'
+	import WorkspaceDeployLayout from './WorkspaceDeployLayout.svelte'
+	import OnBehalfOfSelector, {
+		needsOnBehalfOfSelection,
+		type OnBehalfOfChoice,
+		type OnBehalfOfDetails
+	} from './OnBehalfOfSelector.svelte'
+	import ParentWorkspaceProtectionAlert from './ParentWorkspaceProtectionAlert.svelte'
+	import { useOperatingWorkspace } from '$lib/components/operatingWorkspace.svelte'
+
+	const operatingWorkspace = useOperatingWorkspace()
+
+	const dispatch = createEventDispatcher()
+
+	interface Props {
+		kind: Kind
+		initialPath?: string
+		additionalInformation?: AdditionalInformation | undefined
+		workspaceToDeployTo?: string | undefined
+		hideButton?: boolean
+		canDeployToWorkspace?: boolean
+	}
+
+	let {
+		kind,
+		initialPath = '',
+		additionalInformation = undefined,
+		workspaceToDeployTo = $bindable(undefined),
+		hideButton = false,
+		canDeployToWorkspace = $bindable(true)
+	}: Props = $props()
+
+	let canSeeTarget: 'yes' | 'cant-deploy-to-workspace' | 'cant-see-all-deps' | undefined =
+		$state(undefined)
+	/** What the target answered when it refused, for a destination whose credential can go stale. */
+	let targetError: string | undefined = $state(undefined)
+
+	// The two destinations a workspace can have: its parent on this instance, and a workspace on
+	// another instance. Both are set by an admin, so a workspace may have either, both or neither.
+	type Destination = 'parent' | 'remote'
+	let parentWorkspace: string | undefined = $state(undefined)
+	let remoteStatus = $state<RemoteDeployStatus | undefined>(undefined)
+	let destination: Destination | undefined = $state(undefined)
+	let remoteTarget = $derived(remoteStatus?.target)
+	let isRemote = $derived(destination === 'remote')
+
+	type Dependency = { kind: Kind; path: string; include: boolean }
+	let dependencies: Dependency[] | undefined = $state<Dependency[] | undefined>(undefined)
+
+	let allAlreadyExists: { [key: string]: boolean } = $state({})
+
+	let diffDrawer: DiffDrawer | undefined = $state(undefined)
+	let notSet: boolean | undefined = $state(undefined)
+	let isFlow: boolean | undefined = $state(undefined)
+
+	// On-behalf-of tracking for flows and scripts
+	// Source workspace on_behalf_of emails (keyed by kind:path)
+	let sourceOnBehalfOfInfo = $state<Record<string, string | undefined>>({})
+	// Target workspace on_behalf_of emails (keyed by kind:path)
+	let targetOnBehalfOfInfo = $state<Record<string, string | undefined>>({})
+	let onBehalfOfChoice = $state<Record<string, OnBehalfOfChoice>>({})
+	let customOnBehalfOf = $state<Record<string, OnBehalfOfDetails>>({})
+	let canPreserveOnBehalfOf = $state(false)
+
+	// Check if an item needs on_behalf_of selection
+	function itemNeedsOnBehalfOfSelection(statusPath: string, kind: string): boolean {
+		return needsOnBehalfOfSelection(kind, sourceOnBehalfOfInfo[statusPath])
+	}
+
+	/** Triggers and agents record who they run as by principal, the rest by address. */
+	function usesPrincipal(kind: Kind): boolean {
+		return kind === 'trigger' || kind === 'resource'
+	}
+
+	/**
+	 * Get the on_behalf_of value for deployment based on user's choice.
+	 * Returns an email for flows/scripts/apps, or permissioned_as (u/username, g/group) for
+	 * triggers/schedules and agents.
+	 */
+	function getOnBehalfOfForDeploy(statusPath: string, kind: Kind): string | undefined {
+		const choice = onBehalfOfChoice[statusPath]
+		if (choice === 'target') return targetOnBehalfOfInfo[statusPath]
+		if (choice === 'custom') {
+			const details = customOnBehalfOf[statusPath]
+			return usesPrincipal(kind) ? details?.permissionedAs : details?.email
+		}
+		// 'me' or undefined = don't pass, backend will use deploying user's identity
+		return undefined
+	}
+
+	/**
+	 * Authorization half of the on_behalf_of pair for flows/scripts. Only a custom pick
+	 * names one; for every other choice the backend derives it from the email, so
+	 * returning undefined clears the source item's value rather than keeping it.
+	 */
+	function getOnBehalfOfPermissionedAsForDeploy(
+		statusPath: string,
+		kind: Kind
+	): string | undefined {
+		if (usesPrincipal(kind) || onBehalfOfChoice[statusPath] !== 'custom') return undefined
+		return customOnBehalfOf[statusPath]?.permissionedAs
+	}
+
+	async function reload(path: string) {
+		const target = workspaceToDeployTo
+		// Everything below is about this one target; switching destination starts its own pass, and
+		// the one it replaced must not write its answers into the new one's state.
+		const stillCurrent = () => target === workspaceToDeployTo
+		canSeeTarget = undefined
+		targetError = undefined
+		dependencies = undefined
+		allAlreadyExists = {}
+		deploymentStatus = {}
+		targetOnBehalfOfInfo = {}
+		onBehalfOfChoice = {}
+		customOnBehalfOf = {}
+		try {
+			// Being superadmin here says nothing about the other instance, so a remote target is
+			// always asked.
+			let canPreserve = true
+			if (!$superadmin || isRemote) {
+				const targetUser = await UserService.whoami({ workspace: target! })
+				canPreserve =
+					targetUser.is_admin ||
+					targetUser.is_super_admin ||
+					targetUser.groups?.includes('wm_deployers') ||
+					false
+			}
+			if (!stillCurrent()) return
+			canPreserveOnBehalfOf = canPreserve
+			canSeeTarget = 'yes'
+		} catch (e: any) {
+			if (!stillCurrent()) return
+			canSeeTarget = 'cant-deploy-to-workspace'
+			targetError = e?.body ?? e?.message
+			canPreserveOnBehalfOf = false
+			return
+		}
+
+		let allDeps
+		try {
+			allDeps = await getDependencies(kind, path)
+		} catch {
+			if (!stillCurrent()) return
+			canSeeTarget = 'cant-see-all-deps'
+			return
+		}
+
+		let sortedSet: { kind: Kind; path: string }[] = []
+		allDeps.forEach((x) => {
+			if (!sortedSet.find((y) => y.kind == x.kind && y.path == x.path)) {
+				sortedSet.push(x)
+			}
+		})
+		for (const dep of sortedSet) {
+			const exists = await checkAlreadyExists(dep.kind, dep.path)
+			if (!stillCurrent()) return
+			allAlreadyExists[computeStatusPath(dep.kind, dep.path)] = exists
+		}
+		dependencies = sortedSet.map((x) => ({
+			...x,
+			include:
+				x.kind != 'variable' &&
+				x.kind != 'resource' &&
+				x.kind != 'resource_type' &&
+				(x.kind != 'folder' || !allAlreadyExists[computeStatusPath(x.kind, x.path)])
+		}))
+
+		// Fetch on_behalf_of_email for flows, scripts, apps, and triggers from both workspaces
+		for (const dep of sortedSet.filter((d) =>
+			['flow', 'script', 'app', 'trigger', 'resource'].includes(d.kind)
+		)) {
+			const key = computeStatusPath(dep.kind, dep.path)
+			let source: string | undefined
+			let targetValue: string | undefined
+			try {
+				source = await getOnBehalfOf(
+					dep.kind,
+					dep.path,
+					$operatingWorkspace!,
+					additionalInformation
+				)
+			} catch {}
+			try {
+				targetValue = await getOnBehalfOf(dep.kind, dep.path, target!, additionalInformation)
+			} catch {}
+			if (!stillCurrent()) return
+			sourceOnBehalfOfInfo[key] = source
+			targetOnBehalfOfInfo[key] = targetValue
+		}
+	}
+
+	async function getDependencies(
+		kind: Kind,
+		path: string
+	): Promise<{ kind: Kind; path: string }[]> {
+		async function rec(kind: Kind, path: string): Promise<{ kind: Kind; path: string }[]> {
+			if (kind == 'schedule') {
+				const schedule = await ScheduleService.getSchedule({
+					workspace: $operatingWorkspace!,
+					path
+				})
+				if (schedule.script_path && schedule.script_path != '') {
+					if (schedule.script_path) {
+						return [{ kind: 'script', path: schedule.script_path }]
+					} else {
+						return [{ kind: 'flow', path: schedule.script_path }]
+					}
+				} else {
+					return []
+				}
+			} else if (kind == 'flow') {
+				const flow = await FlowService.getFlowByPath({ workspace: $operatingWorkspace!, path })
+				return getAllModules(flow.value.modules, flow.value.failure_module).flatMap((x) => {
+					let result: { kind: Kind; path: string }[] = []
+					if (x.value.type == 'script' || x.value.type == 'rawscript' || x.value.type == 'flow') {
+						result.push(...collectTransformRefs(x.value.input_transforms))
+					}
+					if (x.value.type == 'script') {
+						if (x.value.path && !x.value.path.startsWith('hub/')) {
+							result.push({ kind: 'script', path: x.value.path })
+						}
+					} else if (x.value.type == 'flow') {
+						if (x.value.path) {
+							result.push({ kind: 'flow', path: x.value.path })
+						}
+					} else if (x.value.type == 'aiagent') {
+						result.push(...aiAgentModuleDependencies(x.value))
+					}
+					return result
+				})
+			} else if (kind == 'app') {
+				const app = await AppService.getAppByPath({ workspace: $operatingWorkspace!, path })
+				let result: { kind: Kind; path: string }[] = []
+				if (app.raw_app) {
+					const rawAppValue = app.value as { runnables?: Record<string, Runnable> }
+					for (const runnable of Object.values(rawAppValue.runnables ?? {})) {
+						if (isRunnableByPath(runnable)) {
+							if (runnable.runType == 'script') {
+								result.push({ kind: 'script', path: runnable.path })
+							} else if (runnable.runType == 'flow') {
+								result.push({ kind: 'flow', path: runnable.path })
+							} else if (runnable.runType == 'agent') {
+								result.push({ kind: 'resource', path: runnable.path })
+							}
+						}
+					}
+				} else {
+					let appValue = app.value as App
+					getAllGridItems(appValue).forEach((gridItem) => {
+						const ci = gridItem.data.componentInput
+						if (ci?.type == 'runnable' && isRunnableByPath(ci.runnable)) {
+							if (ci.runnable.runType == 'script') {
+								result.push({ kind: 'script', path: ci.runnable.path })
+							} else if (ci.runnable.runType == 'flow') {
+								result.push({ kind: 'flow', path: ci.runnable.path })
+							}
+						}
+					})
+				}
+				return result
+			} else if (kind == 'resource') {
+				const res = await ResourceService.getResource({ workspace: $operatingWorkspace!, path })
+				function recObj(obj: any): { kind: Kind; path: string }[] {
+					if (typeof obj == 'string') {
+						if (obj.startsWith('$var:')) {
+							return [{ kind: 'variable', path: obj.substring(5) }]
+						} else if (obj.startsWith('$jsonvar:')) {
+							return [{ kind: 'variable', path: obj.substring(9) }]
+						} else if (obj.startsWith('$res:')) {
+							return [{ kind: 'resource', path: obj.substring(5) }]
+						}
+						return []
+					} else if (typeof obj == 'object' && obj != null) {
+						return Object.values(obj).flatMap((x) => recObj(x))
+					} else {
+						return []
+					}
+				}
+
+				return [
+					...recObj(res.value),
+					...(res.resource_type == 'ai_agent' ? agentResourceDependencies(res.value) : []),
+					{ kind: 'resource_type' as Kind, path: res.resource_type }
+				]
+			} else if (kind == 'trigger') {
+				if (additionalInformation?.triggers) {
+					return getTriggerDependency(
+						additionalInformation.triggers.kind,
+						path,
+						$operatingWorkspace!
+					)
+				}
+				throw new Error('Missing trigger information')
+			} else if (kind == 'script') {
+				const imports = await WorkspaceService.getImports({
+					workspace: $operatingWorkspace!,
+					importerPath: path
+				})
+				return imports.map((importedPath) => ({ kind: 'script' as Kind, path: importedPath }))
+			}
+			return []
+		}
+		let toProcess = [{ kind, path }]
+		let processedSet = new Set<string>()
+		let processed: { kind: Kind; path: string }[] = []
+		while (toProcess.length > 0) {
+			const { kind, path } = toProcess.pop()!
+			const key = `${kind}:${path}`
+			if (processedSet.has(key)) {
+				continue
+			}
+			processedSet.add(key)
+			toProcess.push(...(await rec(kind, path)))
+			processed.push({ kind, path })
+		}
+		let folders: string[] = []
+		for (const p of processed) {
+			let split = p.path.split('/')
+			if (split.length > 2 && split[0] == 'f' && !folders.includes(split[1])) {
+				folders.push(split[1])
+				processed.push({ kind: 'folder', path: split[1] })
+			}
+		}
+		return processed
+	}
+
+	async function checkAlreadyExists(kind: Kind, path: string): Promise<boolean> {
+		return checkItemExists(kind, path, workspaceToDeployTo!, additionalInformation)
+	}
+
+	let deploymentStatus: Record<
+		string,
+		{ status: 'loading' | 'deployed' | 'failed'; error?: string }
+	> = $state({})
+
+	async function deploy(kind: Kind, path: string) {
+		const statusPath = computeStatusPath(kind, path)
+		const target = workspaceToDeployTo
+		deploymentStatus[statusPath] = { status: 'loading' }
+
+		const result = await deployItem({
+			kind,
+			path,
+			workspaceFrom: $operatingWorkspace!,
+			workspaceTo: target!,
+			additionalInformation,
+			onBehalfOf: getOnBehalfOfForDeploy(statusPath, kind),
+			onBehalfOfPrincipal: getOnBehalfOfPermissionedAsForDeploy(statusPath, kind),
+			targetBaseUrl: isRemote ? remoteTarget?.base_url : undefined
+		})
+
+		// The statuses on screen are the current destination's; this deploy went to `target`.
+		if (target !== workspaceToDeployTo) return
+		if (result.success) {
+			allAlreadyExists[statusPath] = true
+			deploymentStatus[statusPath] = { status: 'deployed' }
+		} else {
+			deploymentStatus[statusPath] = { status: 'failed', error: result.error }
+		}
+	}
+
+	export function deployAll() {
+		dependencies?.slice().forEach(async ({ kind, path, include }) => {
+			if (include) {
+				await deploy(kind, path)
+			}
+		})
+		dispatch('update', initialPath)
+	}
+
+	function computeStatusPath(kind: Kind, path: string) {
+		return `${kind}:${path}`
+	}
+
+	async function showDiff(kind: Kind, path: string) {
+		diffDrawer?.openDrawer()
+		let values = await Promise.all([
+			getItemValue(kind, path, workspaceToDeployTo!, additionalInformation),
+			getItemValue(kind, path, $operatingWorkspace!, additionalInformation)
+		])
+		diffDrawer?.setDiff({
+			mode: 'simple',
+			original: values?.[0] as any,
+			current: values?.[1] as any,
+			title: 'Staging/prod <> Dev'
+		})
+	}
+
+	async function loadDestinations() {
+		const workspace = $operatingWorkspace!
+		const [deployTo, remote] = await Promise.all([
+			WorkspaceService.getDeployTo({ workspace }),
+			WorkspaceService.getRemoteDeployTarget({ workspace }).catch(() => undefined)
+		])
+		if (workspace !== $operatingWorkspace) return
+		parentWorkspace = deployTo.deploy_to
+		remoteStatus = remote
+		// Keep the user's pick across a reload, but only while this workspace still has it: the
+		// drawer stays mounted when the workspace is switched.
+		const available = {
+			parent: parentWorkspace != undefined,
+			remote: remote?.target != undefined
+		}
+		if (!destination || !available[destination]) {
+			destination = available.parent ? 'parent' : available.remote ? 'remote' : undefined
+		}
+		notSet = destination == undefined
+	}
+
+	$effect(() => {
+		$operatingWorkspace && untrack(() => loadDestinations())
+	})
+
+	// Until the caller has a token for the remote instance there is nothing to deploy against, so
+	// the target stays unset and the drawer's Deploy buttons stay disabled.
+	let destinationWorkspace = $derived(
+		destination === 'parent'
+			? parentWorkspace
+			: isRemote && remoteStatus?.connection
+				? remoteDeployWorkspace($operatingWorkspace!, remoteStatus.connection)
+				: undefined
+	)
+	let destinationLabel = $derived(
+		isRemote && remoteTarget ? remoteDeployLabel(remoteTarget) : (parentWorkspace ?? '')
+	)
+	$effect(() => {
+		workspaceToDeployTo = destinationWorkspace
+	})
+
+	$effect(() => {
+		workspaceToDeployTo && initialPath && untrack(() => reload(initialPath))
+	})
+
+	// Transform dependencies to deployable item format for the shared layout
+	let deployableItems = $derived(
+		(dependencies ?? []).map((dep) => ({
+			key: computeStatusPath(dep.kind, dep.path),
+			path: dep.path,
+			kind: dep.kind,
+			include: dep.include,
+			triggerKind: dep.kind === 'trigger' ? additionalInformation?.triggers?.kind : undefined
+		}))
+	)
+
+	let selectedItems = $derived<string[]>(
+		(dependencies ?? [])
+			.filter((dep) => dep.include)
+			.map((dep) => computeStatusPath(dep.kind, dep.path))
+	)
+
+	let allSelected = $derived(
+		dependencies != null && dependencies.length > 0 && dependencies.every((dep) => dep.include)
+	)
+
+	// Check if all required on_behalf_of selections are made
+	let hasUnselectedOnBehalfOf = $derived(
+		selectedItems.some((statusPath) => {
+			const dep = dependencies?.find((d) => computeStatusPath(d.kind, d.path) === statusPath)
+			if (!dep) return false
+			return (
+				itemNeedsOnBehalfOfSelection(statusPath, dep.kind) &&
+				onBehalfOfChoice[statusPath] === undefined
+			)
+		})
+	)
+
+	function toggleItem(item: { key: string }) {
+		if (dependencies) {
+			const idx = dependencies.findIndex(
+				(dep) => computeStatusPath(dep.kind, dep.path) === item.key
+			)
+			if (idx !== -1) {
+				dependencies[idx].include = !dependencies[idx].include
+			}
+		}
+	}
+
+	function selectAll() {
+		if (dependencies) {
+			dependencies = dependencies.map((dep) => ({ ...dep, include: true }))
+		}
+	}
+
+	function deselectAll() {
+		if (dependencies) {
+			dependencies = dependencies.map((dep) => ({ ...dep, include: false }))
+		}
+	}
+</script>
+
+<div class="mt-6"></div>
+
+{#if !$enterpriseLicense}
+	<Alert type="warning" title="Enterprise license required"
+		>Deploy to staging/prod from the web UI is only available with an enterprise license</Alert
+	>
+{:else if notSet == true}
+	<Alert type="error" title="Deploy destination not set up"
+		>As an admin, go to Settings {'->'} Workspace {'->'} Dev workspace, to pair this workspace with a
+		prod workspace on this instance or point it at a workspace on another instance</Alert
+	>
+{:else}
+	<Alert type="info" title="Shareable page"
+		>Share this <a href="/deploy/{kind}/{initialPath}">link</a> to have another properly permissioned
+		user do the deployment</Alert
+	>
+
+	<h3 class="mb-2 mt-8"
+		>Destination&nbsp; <Tooltip
+			>Where this workspace deploys is set in the workspace settings</Tooltip
+		></h3
+	>
+	{#if parentWorkspace && remoteTarget}
+		<ToggleButtonGroup
+			selected={destination}
+			onSelected={(v) => (destination = v as Destination)}
+			noWFull
+		>
+			{#snippet children({ item })}
+				<ToggleButton
+					value="parent"
+					label={parentWorkspace ?? ''}
+					tooltip="Workspace this one deploys into on this instance"
+					{item}
+				/>
+				<ToggleButton
+					value="remote"
+					label={remoteDeployLabel(remoteTarget!)}
+					tooltip="Workspace on another instance"
+					{item}
+				/>
+			{/snippet}
+		</ToggleButtonGroup>
+	{:else}
+		<TextInput value={destinationLabel} inputProps={{ disabled: true }} class="max-w-xs" />
+	{/if}
+
+	{#if isRemote && remoteTarget}
+		<div class="mt-3">
+			<RemoteDeployConnect
+				workspace={$operatingWorkspace!}
+				target={remoteTarget}
+				connection={remoteStatus?.connection}
+				returnTo={kind === 'trigger'
+					? undefined
+					: `/deploy/${kind}/${initialPath}?workspace=${encodeURIComponent($operatingWorkspace!)}`}
+				onChange={loadDestinations}
+			/>
+		</div>
+	{/if}
+
+	{#if workspaceToDeployTo}
+		<ParentWorkspaceProtectionAlert
+			parentWorkspaceId={workspaceToDeployTo}
+			displayName={destinationLabel}
+			onUpdateCanDeploy={(canDeploy) => {
+				canDeployToWorkspace = canDeploy
+			}}
+		/>
+	{/if}
+
+	{#if workspaceToDeployTo == undefined}
+		<!-- A remote destination nobody has connected to yet: the connect form above is the next step. -->
+	{:else if canSeeTarget == undefined}
+		<div class="mt-6"></div>
+		<Loader2 class="animate-spin" />
+	{:else if canSeeTarget == 'yes'}
+		<h3 class="mb-6 mt-16">All related deployable items</h3>
+
+		<DiffDrawer bind:this={diffDrawer} {isFlow} />
+
+		<WorkspaceDeployLayout
+			items={deployableItems}
+			{selectedItems}
+			{deploymentStatus}
+			selectablePredicate={() => true}
+			{allSelected}
+			onToggleItem={toggleItem}
+			onSelectAll={selectAll}
+			onDeselectAll={deselectAll}
+			emptyMessage="No deployable items found"
+		>
+			{#snippet itemActions(item)}
+				{@const statusPath = item.key}
+				{@const exists = allAlreadyExists[statusPath]}
+				{@const status = deploymentStatus[statusPath]}
+				{@const targetValue = targetOnBehalfOfInfo[statusPath]}
+
+				<!-- On-behalf-of selector -->
+				{#if itemNeedsOnBehalfOfSelection(statusPath, item.kind)}
+					<OnBehalfOfSelector
+						targetWorkspace={workspaceToDeployTo!}
+						{targetValue}
+						selected={onBehalfOfChoice[statusPath]}
+						onSelect={(choice, details) => {
+							onBehalfOfChoice[statusPath] = choice
+							if (details) customOnBehalfOf[statusPath] = details
+						}}
+						kind={item.kind}
+						canPreserve={canPreserveOnBehalfOf}
+						customValue={customOnBehalfOf[statusPath]?.permissionedAs}
+					/>
+				{/if}
+
+				{#if item.kind === 'raw_app'}
+					<Badge small icon={{ icon: FileJson }}>Raw</Badge>
+				{/if}
+				{#if exists === false}
+					{#if item.include}
+						<Badge
+							>New <Tooltip
+								>This {item.kind} doesn't exist yet on the target and will be created by the deployment</Tooltip
+							></Badge
+						>
+					{:else}
+						<Badge color="red">
+							Missing
+							<Tooltip
+								>{#if item.kind == 'resource_type'}
+									Resource types are not re-deployed by default. We strongly recommend to add shared
+									resource types in 'admin' workspace, which will have them be shared to every
+									workspace.
+								{:else}
+									This {item.kind} doesn't exist and is not included in the deployment. Variables and
+									Resources are considered to be workspace specific and are never included by default.
+								{/if}</Tooltip
+							>
+						</Badge>
+					{/if}
+				{:else if exists === true && !status}
+					<Button
+						size="xs"
+						variant="subtle"
+						onclick={() => {
+							showDiff(item.kind, item.path)
+							isFlow = item.kind === 'flow'
+						}}
+					>
+						<DiffIcon class="w-3 h-3" />
+						Show diff
+					</Button>
+				{/if}
+
+				{#if !status}
+					<Button
+						color="light"
+						size="xs"
+						disabled={!canDeployToWorkspace ||
+							(itemNeedsOnBehalfOfSelection(statusPath, item.kind) &&
+								onBehalfOfChoice[statusPath] === undefined)}
+						onclick={() => deploy(item.kind, item.path)}>Deploy</Button
+					>
+				{/if}
+			{/snippet}
+
+			{#snippet footer()}
+				<div class="flex flex-col items-end gap-2">
+					{#if !hideButton}
+						<Button on:click={deployAll} disabled={!canDeployToWorkspace || hasUnselectedOnBehalfOf}
+							>Deploy all toggled</Button
+						>
+					{/if}
+					{#if hasUnselectedOnBehalfOf}
+						<span class="text-xs text-yellow-600">
+							{#if kind === 'trigger'}
+								You must set the "permissioned as" user for all triggers before deploying
+								<Tooltip class="text-yellow-600">
+									The "permissioned as" field defines which user's permissions will be applied when
+									the trigger fires. Make sure this is set appropriately before deploying.
+								</Tooltip>
+							{:else}
+								You must set the "on behalf of" user for all items before deploying
+								<Tooltip class="text-yellow-600">
+									The "run on behalf of" field defines which user's permissions will be applied
+									during execution. Make sure this is set to an appropriate user before deploying.
+								</Tooltip>
+							{/if}
+						</span>
+					{/if}
+				</div>
+			{/snippet}
+		</WorkspaceDeployLayout>
+	{:else if canSeeTarget == 'cant-see-all-deps'}
+		<div class="my-2"></div>
+		<Alert type="error" title="User doesn't have visibility over all dependencies"
+			>You do not have visibility over some of the dependencies of this item. Ask a permissioned
+			user to deploy this item using the shareable link or get the proper permissions on the
+			dependencies</Alert
+		>
+	{:else if isRemote}
+		<div class="my-2"></div>
+		<Alert type="error" title="Could not deploy to {destinationLabel}"
+			><p>{targetError ?? 'The remote instance did not accept the request'}</p>
+			<p class="mt-1"
+				>Disconnect above and connect again with a valid token for that instance, or ask someone
+				permissioned there to deploy this item using the shareable link</p
+			></Alert
+		>
+	{:else}
+		<div class="my-2"></div>
+		<Alert type="error" title="User not allowed to deploy to this workspace"
+			>Ask a permissioned user to deploy this item using the shareable link or get the proper
+			permissions on the target workspace</Alert
+		>
+	{/if}
+{/if}

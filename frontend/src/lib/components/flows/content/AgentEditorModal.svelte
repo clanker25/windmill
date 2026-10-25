@@ -1,0 +1,660 @@
+<script lang="ts">
+	import { FlaskConical, Settings, FormInput, History, MessageSquare, Save } from 'lucide-svelte'
+	import ToggleButtonGroup from '$lib/components/common/toggleButton-v2/ToggleButtonGroup.svelte'
+	import ToggleButton from '$lib/components/common/toggleButton-v2/ToggleButton.svelte'
+	import { onDestroy, untrack, type Snippet } from 'svelte'
+	import { resource } from 'runed'
+	import Modal, { type ModalTrailSegment } from '$lib/components/common/modal/Modal.svelte'
+	import PagedContent from '$lib/components/common/modal/PagedContent.svelte'
+	import { Badge, Button, Drawer, DrawerContent } from '$lib/components/common'
+	import LocalDraftBanner from '$lib/components/LocalDraftBanner.svelte'
+	import ResourceVersionHistory from '$lib/components/ResourceVersionHistory.svelte'
+	import { clearPageDrawerAnchor } from '$lib/components/sessions/pageDrawerSession'
+	import { RESOURCES_PATH } from '$lib/components/sessions/previewPaths'
+	import EvalsPane from '$lib/components/aiEvals/EvalsPane.svelte'
+	import type { EvalsLocation } from '$lib/components/aiEvals/evalUtils'
+	import { ResourceService, type AgentDraft } from '$lib/gen'
+	import {
+		agentEditorTarget,
+		agentWriteCount,
+		type AgentEditorTarget,
+		closeAgentEditor,
+		markAgentWritten,
+		openAgentEditor,
+		showAgentEditorTool,
+		showAgentEditorView
+	} from '../agentEditorStore.svelte'
+	import { agentConfigToInputTransforms } from '../agentResourceUtils'
+	import { publishLinkedAgentTools } from '../flowState'
+	import { linkedModulesForAgent, linkedToolsScope } from '../linkedAgentToolsStore.svelte'
+	import AgentEditorHost from './AgentEditorHost.svelte'
+	import AgentSettings from './AgentSettings.svelte'
+	import AgentEvalsModal from './AgentEvalsModal.svelte'
+	import { useOperatingWorkspace } from '$lib/components/operatingWorkspace.svelte'
+	import PageHeaderContent from '$lib/components/PageHeaderContent.svelte'
+	import PathEditPopover from '$lib/components/PathEditPopover.svelte'
+	import { emptyString } from '$lib/utils'
+	import Tooltip from '$lib/components/Tooltip.svelte'
+	import { useEditRights } from '$lib/operatorWriteRights'
+
+	const operatingWorkspace = useOperatingWorkspace()
+
+	interface Props {
+		enableAi?: boolean
+		/** Which targets this mount is responsible for. The target is module-global while several
+		 *  flow editors can be alive at once (a session retains every tab it has visited), so without
+		 *  this each of them would build a whole editor — fetching, inferring tool schemas, and
+		 *  running its own two-way sync against the one draft row. Required rather than defaulted: a
+		 *  mount that guesses wrong renders nothing, and silence is a poor way to find that out. */
+		owns: (target: AgentEditorTarget) => boolean
+		/** A deploy moved the agent from `from` to `to`. What names the old path belongs to the surface
+		 *  that opened the editor: a flow's own steps, a page's URL. */
+		onRenamed?: (from: string, to: string) => void
+		/** `page` fills its container with the editor's header and body instead of opening a dialog. */
+		layout?: 'modal' | 'page'
+		/** Where closing leads, for a layout that has no dialog to dismiss. `deployed` is false for an
+		 *  agent that exists only as a draft, which has no page of its own to return to. */
+		onClose?: (deployed: boolean) => void
+		/** Ran after every successful deploy, with the path written. */
+		onDeployed?: (path: string) => void
+		/** Open on the settings, as a link to them does. */
+		startInSettings?: boolean
+	}
+
+	let {
+		enableAi = false,
+		owns,
+		onRenamed = undefined,
+		layout = 'modal',
+		onClose = undefined,
+		onDeployed = undefined,
+		startInSettings = false
+	}: Props = $props()
+
+	// Every target names the surface that opened it, and only a flow step or a resource row can:
+	// an agent used as a tool of the agent being edited stays part of it, with no way in this editor
+	// to link it to a saved agent of its own. So `owns` decides alone — nothing here has to adopt a
+	// target opened from inside another editor.
+	let target = $derived.by(() => {
+		const t = agentEditorTarget()
+		return t && owns(t) ? t : undefined
+	})
+	// The last agent this dialog showed. The version pane keeps working after `onRestore` returns —
+	// it reloads its list keyed on the path it was given — while the restore handler has already
+	// closed the dialog and dropped the target. Reading the live one there throws, and the throw
+	// lands in the global unhandled-rejection handler as a bare toast with no stack.
+	let lastShownAgent = $state<string | undefined>(undefined)
+	$effect(() => {
+		const p = target?.path
+		if (p) untrack(() => (lastShownAgent = p))
+	})
+
+	let ws = $derived(target?.workspace ?? $operatingWorkspace)
+	let host = $state<ReturnType<typeof AgentEditorHost> | undefined>(undefined)
+	let versionDrawer: Drawer | undefined = $state(undefined)
+	let settingsDrawer: Drawer | undefined = $state(undefined)
+	/** Held by the rename popover while it is open; the band's trail reads it so the path does not
+	 *  reflow under the pointer as the user types. */
+	let pathSnapshot = $state<string | undefined>(undefined)
+	let evalsModal: AgentEvalsModal | undefined = $state(undefined)
+	let saving = $state(false)
+
+	// Counted per agent, so a deploy that leaves the editor on the same agent still refetches the
+	// version it just minted. Shared, so the step card behind the dialog refetches on the same signal.
+	let writes = $derived(agentWriteCount(ws, target?.path))
+	let versionResource = resource(
+		() => ({ ws, path: target?.path, writes }),
+		async ({ ws, path, writes }) => {
+			if (!ws || !path) return { ws, path, writes }
+			const history = await ResourceService.getResourceHistory({ workspace: ws, path })
+			return { ws, path, writes, version: history.versions?.[0]?.version }
+		}
+	)
+	// `writes` as well as the identity: runed neither aborts nor tags a superseded request, so a
+	// response from before a deploy can land after the one for it and relabel the badge with the
+	// version that deploy replaced.
+	let version = $derived.by(() => {
+		const loaded = versionResource.current
+		return loaded !== undefined &&
+			loaded.ws === ws &&
+			loaded.path === target?.path &&
+			loaded.writes === writes
+			? loaded.version
+			: undefined
+	})
+
+	let draft = $derived(host?.draftHandle())
+	let testPane = $derived(host?.testPaneHandle())
+	// The load refused this path, so there is no agent to deploy, evaluate or show a history of:
+	// the dialog carries only the refusal the host renders.
+	let refused = $derived(draft?.refusal != null)
+	let inEvals = $derived(target?.view === 'evals' && !refused)
+	// A level of its own in the dialog; the page layout opens the same settings in a drawer instead.
+	let inSettings = $derived(target?.view === 'settings' && !refused)
+	let readOnly = $derived(draft ? !draft.canWrite : false)
+	let draftOnly = $derived(draft?.noDeployed ?? false)
+	// Evals run against the deployed agent, and a draft-only one has none: the backend's
+	// `require_agent` would reject every run. Evaluating is authoring, so it is for those who can
+	// edit the agent, except a role without `code`: eval datasets are refused to it
+	// (`check_role_can_code`) whatever its flows right. Unknown until the load answers, and warming
+	// the pane loads it.
+	const editRights = useEditRights(() => ws)
+	let canEvaluate = $derived(
+		draft != undefined &&
+			!draft.loading &&
+			!draftOnly &&
+			!readOnly &&
+			!refused &&
+			editRights.capabilities.code
+	)
+	// The draft's path, so a rename shows where it is typed — including a never-deployed agent,
+	// stored at a minted `draft_<uuid>` path and named by the path its first deploy will create,
+	// as the home list names it. Falls back to the target while the draft is still loading.
+	let shownPath = $derived(draft?.state?.path || target?.path)
+
+	// Where the evals pane is within itself, so its levels extend this dialog's trail rather than
+	// opening a dialog of their own. Cleared on the way in: the pane reports a level once it is on
+	// one, and never that it is back at its root.
+	let evalsLocation = $state<EvalsLocation | undefined>(undefined)
+	let evalsKey = $derived(`${ws}:${target?.path}:${target?.view}`)
+	$effect(() => {
+		evalsKey
+		untrack(() => (evalsLocation = undefined))
+	})
+
+	const AGENT_DESCRIPTION = 'Changes here update the saved agent, and every flow that links to it.'
+
+	let root = $derived<ModalTrailSegment>({
+		label: shownPath ?? 'Agent',
+		onclick: inEvals || inSettings ? () => showAgentEditorView(undefined) : undefined
+	})
+	let trail = $derived<ModalTrailSegment[]>(
+		inEvals
+			? [
+					root,
+					{ label: 'Evals', onclick: evalsLocation ? evalsLocation.back : undefined },
+					...(evalsLocation ? [{ label: evalsLocation.label }] : [])
+				]
+			: inSettings
+				? [root, { label: 'Settings' }]
+				: [root]
+	)
+	// The root's alone: below it the header's second line is the way back, and what a level is for
+	// belongs to that level rather than to the dialog's own name.
+	let description = $derived(inEvals || inSettings || refused ? undefined : AGENT_DESCRIPTION)
+
+	// The dialog's levels are its pages; a page has none, so evals open over it as a dialog.
+	function openEvals() {
+		if (layout === 'modal') showAgentEditorView('evals')
+		else evalsModal?.openModal()
+	}
+
+	function openSettings() {
+		if (layout === 'modal') showAgentEditorView('settings')
+		else settingsDrawer?.openDrawer()
+	}
+
+	let openedSettings = false
+	$effect(() => {
+		if (startInSettings && draft?.state && settingsDrawer && !openedSettings) {
+			openedSettings = true
+			untrack(openSettings)
+		}
+	})
+
+	/** The unsaved edits, in the shape the server builds from a deployed config
+	 *  (`ai_evals/run.rs` `config_to_draft`), so a draft run's hash can be recognised as equal to
+	 *  the version it is later deployed as. */
+	function editedConfig(): AgentDraft {
+		const args = draft?.state?.args
+		return {
+			input_transforms: agentConfigToInputTransforms(args ?? {}) as Record<string, unknown>,
+			tools: (args?.tools ?? []) as unknown[] as Record<string, unknown>[]
+		}
+	}
+
+	/** A resources-page row anchors itself in the hash on the way in, so closing has to clear it or
+	 *  the URL keeps claiming the agent is open and a refresh reopens it. Anchored to that page, so
+	 *  this is a no-op when the editor was opened from a flow. */
+	function close() {
+		// Unknown until the load answers, and a detail page that does not exist is the worse guess.
+		const deployed = draft != undefined && !draft.loading && !draftOnly && !refused
+		closeAgentEditor()
+		if (layout === 'modal') void clearPageDrawerAnchor(RESOURCES_PATH)
+		onClose?.(deployed)
+	}
+
+	// The target is module-global and outlives this component: navigating away takes the mount that
+	// owns it without passing through `close()`, and what it leaves behind reopens the dialog on the
+	// way back and tells the flow editor a dialog is over its graph. Only its own, so a mount going
+	// down never drops a target another one is showing.
+	onDestroy(() => {
+		const t = agentEditorTarget()
+		if (t && owns(t)) closeAgentEditor()
+	})
+
+	/** What the flow behind a write has to be told about it, captured before the request rather than
+	 *  read after: the dialog stays closable while one is in flight and can be pointed at another
+	 *  agent by the time it lands, and the reactive `ws`/`target` would then name that one. */
+	type WriteTarget = { ws: string | undefined; path: string; host: AgentEditorTarget['host'] }
+	function currentWriteTarget(): WriteTarget | undefined {
+		const t = target
+		return t ? { ws, path: t.path, host: t.host } : undefined
+	}
+	/** Reconciling is best-effort: it refreshes what a write changed, and the write itself has
+	 *  already landed. A rejection here must not surface as an unhandled one — the global handler
+	 *  turns those into a bare toast with no stack, which says nothing about where it came from. */
+	function reconcileQuietly(at: WriteTarget | undefined, path: string) {
+		try {
+			void Promise.resolve(reconcile(at, path)).catch((err) => {
+				console.error('agent editor: could not refresh what links to', path, err)
+			})
+		} catch (err) {
+			console.error('agent editor: could not refresh what links to', path, err)
+		}
+	}
+
+	function reconcile(at: WriteTarget | undefined, path: string) {
+		if (!at?.ws) return
+		markAgentWritten(at.ws, path)
+		if (!at.host) return
+		// The host graph resolves a linked agent's tool nodes from the resource, so it has to re-read
+		// what the write just changed. Every step of that flow linking this agent, not only the one
+		// the editor was opened from: they all show tools the write may have moved. Looked up under
+		// the path the editor opened, since a rename is about to move those steps off it.
+		const scope = linkedToolsScope(at.ws, at.host.flowPath)
+		const moduleIds = new Set(linkedModulesForAgent(scope, at.path))
+		moduleIds.add(at.host.moduleId)
+		return Promise.all(
+			// With the draft: a deploy leaves none, but a version restore leaves the draft standing and
+			// it is still what a test of the host step would run.
+			[...moduleIds].map((moduleId) => publishLinkedAgentTools(path, at.ws, scope, moduleId, true))
+		)
+	}
+
+	let deployingFor = $state<WriteTarget | undefined>(undefined)
+
+	async function onDeploy() {
+		saving = true
+		deployingFor = currentWriteTarget()
+		try {
+			await host?.deploy()
+		} finally {
+			saving = false
+			deployingFor = undefined
+		}
+	}
+
+	/** What a successful deploy has to reconcile. `savedPath` is the path it wrote, which a rename
+	 *  moves off the one the editor opened. */
+	async function onSaved(savedPath: string) {
+		const at = deployingFor ?? currentWriteTarget()
+		// Before the rename is announced: it finds the steps to refresh under the old path.
+		const reconciled = reconcile(at, savedPath)
+		// A new agent's first deploy is announced like a rename even at the same path: the surface
+		// has anchored nothing for it yet, and reopening drops `isNew` now that it exists.
+		if (at && (savedPath !== at.path || target?.isNew)) {
+			onRenamed?.(at.path, savedPath)
+			// The dialog is keyed on the path, so this reloads it on the renamed agent. Only while it
+			// still shows the one deployed: it can be closed or pointed elsewhere mid-request.
+			if (target?.path === at.path) {
+				openAgentEditor({ path: savedPath, workspace: target.workspace, host: target.host })
+			}
+		}
+		await reconciled
+		onDeployed?.(savedPath)
+	}
+</script>
+
+{#if target}
+	{#key `${ws}:${target.path}`}
+		<!-- Bound rather than held open: the store is what decides whether this is mounted, so every
+		     way out has to reach it. The close button and the backdrop only set `open`, and a
+		     dialog left closed over a target still set could never be opened again.
+
+		     `paginated` throughout: the body is one strip of pages (the agent form, then evals), so
+		     the header keeps its height and only the pages move. -->
+		{#if layout === 'modal'}
+			<Modal
+				bind:open={() => true, (open) => !open && close()}
+				kind="X"
+				fillHeight
+				enterConfirms={false}
+				paginated
+				title={shownPath ?? target.path}
+				{trail}
+				{description}
+				{titleBadge}
+				{levelBadge}
+				{settings}
+				class="w-[92vw] sm:w-[92vw] max-w-[1500px] sm:max-w-[1500px] h-[88vh]"
+			>
+				{@render body()}
+			</Modal>
+		{:else}
+			<!-- On its own route the editor's header is the page header: the agent's path is the
+			     breadcrumb, the level it is on reads after that name, and its controls are the band's
+			     actions. -->
+			<PageHeaderContent
+				item={{
+					path: pathSnapshot ?? shownPath,
+					summary: draft?.state?.description,
+					summaryContent: agentSummary,
+					// Only where the rename behind it can be saved: a reader who cannot write this agent
+					// keeps the segment that copies the path, rather than an editor with nothing to edit.
+					pathTrigger: readOnly ? undefined : agentPathTrigger
+				}}
+				afterName={agentHint}
+				actions={settings}
+				separator="always"
+			/>
+			<div class="h-full min-h-0 flex flex-col">
+				<div class="flex-1 min-h-0 px-4 sm:px-6">
+					{@render body()}
+				</div>
+			</div>
+		{/if}
+	{/key}
+
+	<!-- The summary's editor again, hung off the band's path segment so it opens under the path,
+	     with the cursor in the path field. `bind:` cannot be spread, so the slots are written out
+	     twice; both instances bind the same ones and only one is ever open. -->
+	{#snippet agentPathTrigger(pathLabel: Snippet, triggerClass: string)}
+		<!-- Gated like the summary beside it: this renders from the band's tree, where `draft` is
+		     undefined for as long as the modal has not loaded one, and a getter that reads through it
+		     throws there rather than where it was written. The `{:else}` carries the whole load of
+		     that wait: the band gave up its own segment to this snippet, so without it the trail
+		     would show no path until the draft arrives. -->
+		{#if draft?.state}
+			<PathEditPopover
+				label={pathLabel}
+				{triggerClass}
+				focusField="path"
+				bind:summary={
+					() => draft.state?.description ?? '',
+					(v) => {
+						if (draft.state) draft.state.description = v
+					}
+				}
+				bind:path={
+					() => draft.state?.path ?? '',
+					(v) => {
+						if (draft.state) draft.state.path = v
+					}
+				}
+				bind:snapshotPath={pathSnapshot}
+				bind:error={() => host?.pathError(), (error) => host?.setPathError(error)}
+				savedPath={draft?.noDeployed ? undefined : target?.path}
+				kind="resource"
+				workspaceId={ws}
+				pathEditable={!readOnly}
+				summaryEditable={!readOnly}
+			/>
+		{:else}
+			<span class={triggerClass}>{@render pathLabel()}</span>
+		{/if}
+	{/snippet}
+
+	{#snippet agentSummary()}
+		<!-- What the agent is, beside what it is called, and clicking it renames both — the same
+		     shape the script, flow and app editors carry. The version rides along, as the
+		     linked-agent card in the step panel has it. The trail's levels are not here: this layout
+		     opens settings in a drawer and evals over the page, so it never stands on one. -->
+		<div class="flex items-center gap-1 min-w-0">
+			{#if draft?.state}
+				{#snippet summaryText()}
+					<span
+						class="min-w-0 truncate text-xs {emptyString(draft.state?.description)
+							? 'text-tertiary italic font-normal'
+							: 'font-medium text-emphasis'}"
+						title={draft.state?.description}
+						>{emptyString(draft.state?.description)
+							? 'Add a summary...'
+							: draft.state?.description}</span
+					>
+				{/snippet}
+				<PathEditPopover
+					label={summaryText}
+					bind:summary={
+						() => draft.state?.description ?? '',
+						(v) => {
+							if (draft.state) draft.state.description = v
+						}
+					}
+					bind:path={
+						() => draft.state?.path ?? '',
+						(v) => {
+							if (draft.state) draft.state.path = v
+						}
+					}
+					bind:snapshotPath={pathSnapshot}
+					bind:error={() => host?.pathError(), (error) => host?.setPathError(error)}
+					savedPath={draft?.noDeployed ? undefined : target?.path}
+					kind="resource"
+					workspaceId={ws}
+					pathEditable={!readOnly}
+					summaryEditable={!readOnly}
+					penVisibility={emptyString(draft.state.description) ? 'always' : 'hover'}
+				/>
+			{/if}
+			{@render titleBadge()}
+		</div>
+	{/snippet}
+	{#snippet agentHint()}
+		{#if description}
+			<Tooltip>{description}</Tooltip>
+		{/if}
+	{/snippet}
+	{#snippet titleBadge()}
+		<!-- Against the agent's own name wherever it appears, as the linked-agent card in the
+				     step panel has it. -->
+		{#if version != undefined && !refused}
+			<Badge color="gray" class="shrink-0" title="The version runs are recorded against">
+				v{version}
+			</Badge>
+		{/if}
+	{/snippet}
+	{#snippet levelBadge()}
+		<!-- Marks evals, not the agent, so it sits against that level's own name. Dropped a
+				     level deeper, where it would read as marking the run rather than the feature it
+				     belongs to. -->
+		{#if inEvals && !evalsLocation}
+			<Badge color="blue" small class="shrink-0 !py-0 leading-4">Beta</Badge>
+		{/if}
+	{/snippet}
+	<!-- Evals carries none of the editor's actions: nothing there edits the agent, and the run
+			     dialog states for itself whether a run is against the deployed version or the edits. -->
+	{#snippet settings()}
+		<div class="flex flex-row items-center gap-2 shrink-0">
+			{#if !inEvals && !refused}
+				<!-- Switches the editor's right-hand pane, and is drawn only once the agent has
+						     loaded and the pane has picked its first mode. -->
+				{#if testPane?.mode && !inSettings}
+					<ToggleButtonGroup
+						bind:selected={
+							() => testPane?.mode,
+							(mode) => {
+								if (testPane) testPane.mode = mode
+							}
+						}
+						noWFull
+					>
+						{#snippet children({ item })}
+							<ToggleButton
+								size="sm"
+								value="chat"
+								label="Chat"
+								icon={MessageSquare}
+								tooltip="Chat with the agent: each message runs it, and it remembers the conversation"
+								{item}
+							/>
+							<ToggleButton
+								size="sm"
+								value="form"
+								label="Form"
+								icon={FormInput}
+								tooltip="Run the agent once, on the inputs in a form"
+								{item}
+							/>
+						{/snippet}
+					</ToggleButtonGroup>
+				{/if}
+				{#if readOnly}
+					<Badge color="gray" class="shrink-0" title="You do not have write access to this agent">
+						Read only
+					</Badge>
+				{/if}
+				{#if !inSettings}
+					<Button
+						unifiedSize="sm"
+						variant="default"
+						startIcon={{ icon: Settings }}
+						iconOnly
+						title="Settings"
+						on:click={openSettings}
+					/>
+				{/if}
+				{#if canEvaluate}
+					<Button
+						unifiedSize="sm"
+						variant="default"
+						startIcon={{ icon: FlaskConical }}
+						title="Run this agent against a dataset of cases"
+						on:click={openEvals}
+					>
+						Evals
+					</Button>
+				{/if}
+				<Button
+					unifiedSize="sm"
+					variant="default"
+					startIcon={{ icon: History }}
+					iconOnly
+					title="Version history"
+					on:click={() => versionDrawer?.openDrawer()}
+				/>
+				<Button
+					unifiedSize="sm"
+					variant="accent"
+					startIcon={{ icon: Save }}
+					loading={saving}
+					disabled={readOnly}
+					title={readOnly ? 'You do not have write access to this agent' : undefined}
+					on:click={onDeploy}
+				>
+					Deploy
+				</Button>
+			{/if}
+		</div>
+	{/snippet}
+	{#snippet body()}
+		<div class="h-full min-h-0 flex flex-col">
+			<!-- Full-bleed, as a banner is everywhere else: the body's own horizontal padding is
+				     cancelled so it spans it. -->
+			<div class="-mx-4 sm:-mx-6 shrink-0 {inEvals ? 'hidden' : ''}">
+				<LocalDraftBanner
+					show={draft?.sync.hasDraft ?? false}
+					reserveSpace={draft?.sync.hasBaseline ?? false}
+					getDeployed={() => draft?.deployed}
+					getCurrent={() => draft?.state}
+					onDiscard={() => draft?.sync.resetToDeployed(target?.path ?? '')}
+					title="Deployed <> Unsaved agent changes"
+				/>
+			</div>
+			<!-- One strip of pages, so a level slides in from the right the way evals' own levels do.
+			     No `onNavigate`: the arrow keys belong to whichever pane is on screen, and evals answers
+			     them for its own levels. Warmed, as those levels are: a page built on its first visit
+			     lands inside the transition and arrives empty. The page layout has no levels: it opens
+			     settings in a drawer and evals in a dialog, so warming them there would build them twice. -->
+			<PagedContent
+				warm
+				class="flex-1 min-h-0"
+				current={inEvals ? 'evals' : inSettings ? 'settings' : 'agent'}
+				pages={[
+					{ key: 'agent', content: agentPage },
+					...(layout === 'modal' ? [{ key: 'settings', content: settingsPage }] : []),
+					...(layout === 'modal' && canEvaluate ? [{ key: 'evals', content: evalsPage }] : [])
+				]}
+			/>
+		</div>
+	{/snippet}
+
+	<!-- Mounted under the evals level too: it holds the draft the header's banner and Deploy act on,
+	     and the config a draft run is offered on. The target is read optionally: a deploy that
+	     navigates away clears it while these are still rendered. -->
+	{#snippet agentPage()}
+		<AgentEditorHost
+			bind:this={host}
+			path={target?.path ?? ''}
+			workspace={ws}
+			{enableAi}
+			toolId={target?.toolId}
+			onSelectTool={(id) => showAgentEditorTool(id)}
+			{onSaved}
+			isNew={target?.isNew}
+		/>
+	{/snippet}
+
+	{#snippet settingsFields()}
+		{#if draft}
+			<AgentSettings
+				{draft}
+				path={target?.path ?? ''}
+				workspace={ws}
+				bind:error={() => host?.pathError(), (error) => host?.setPathError(error)}
+				onRunAsChange={(runAs) => host?.setRunAs(runAs)}
+			/>
+		{/if}
+	{/snippet}
+
+	{#snippet settingsPage()}
+		<div class="max-w-2xl py-6">{@render settingsFields()}</div>
+	{/snippet}
+
+	{#snippet evalsPage()}
+		<EvalsPane
+			agentPath={target?.path ?? ''}
+			opWorkspace={ws}
+			editedConfig={draft?.sync.hasDraft ? editedConfig : undefined}
+			bind:location={evalsLocation}
+			active={inEvals}
+		/>
+	{/snippet}
+
+	{#if layout === 'page' && ws}
+		<AgentEvalsModal
+			bind:this={evalsModal}
+			agentPath={target?.path ?? ''}
+			workspace={ws}
+			editedConfig={draft?.sync.hasDraft ? editedConfig : undefined}
+		/>
+	{/if}
+
+	<Drawer bind:this={settingsDrawer} size="600px">
+		<DrawerContent title="Settings" on:close={() => settingsDrawer?.closeDrawer()}>
+			{@render settingsFields()}
+		</DrawerContent>
+	</Drawer>
+
+	<Drawer bind:this={versionDrawer} size="1200px">
+		<DrawerContent title="Version history" on:close={() => versionDrawer?.closeDrawer()} noPadding>
+			<ResourceVersionHistory
+				path={target?.path ?? lastShownAgent ?? ''}
+				workspace={ws}
+				canRestore={!readOnly}
+				onRestore={() => {
+					versionDrawer?.closeDrawer()
+					// A restore writes the resource as a deploy does, so the flow behind has to be told
+					// the same way. Captured before closing, which drops the target this reads.
+					const at = currentWriteTarget()
+					// Close the editor too, as the generic resource editor does on a restore: it holds
+					// a baseline captured before the restore, and any local draft on top of it, so
+					// deploying from it afterwards would write the pre-restore value straight back over
+					// the version just restored.
+					close()
+					if (at) reconcileQuietly(at, at.path)
+				}}
+			/>
+		</DrawerContent>
+	</Drawer>
+{/if}
